@@ -20,6 +20,8 @@ constexpr float InitialBackoffSeconds = 1.0f;
 constexpr float MaxBackoffSeconds = 60.0f;
 constexpr float JitterFraction = 0.20f;
 constexpr float PollDelaySeconds = 10.0f;
+constexpr int32 MaxDiagnosticCharacters = 2000;
+constexpr int32 MaxStructuredErrors = 8;
 
 FString SerializeObject(const TSharedPtr<FJsonObject>& Object)
 {
@@ -44,6 +46,154 @@ TSharedPtr<FJsonObject> ParseObject(const FString& Json)
         return nullptr;
     }
     return Object;
+}
+
+FString TruncateDiagnostic(const FString& Text)
+{
+    FString Diagnostic = Text.TrimStartAndEnd();
+    if (Diagnostic.Len() > MaxDiagnosticCharacters)
+    {
+        Diagnostic = Diagnostic.Left(MaxDiagnosticCharacters) + TEXT("...");
+    }
+    return Diagnostic;
+}
+
+FString DescribeErrorFields(const TSharedPtr<FJsonObject>& ErrorObject)
+{
+    if (!ErrorObject.IsValid())
+    {
+        return FString();
+    }
+
+    TArray<FString> Parts;
+    FString Value;
+    if (ErrorObject->TryGetStringField(TEXT("type"), Value) && !Value.IsEmpty())
+    {
+        Parts.Add(FString::Printf(TEXT("type=%s"), *Value));
+    }
+
+    if (ErrorObject->TryGetStringField(TEXT("code"), Value) && !Value.IsEmpty())
+    {
+        Parts.Add(FString::Printf(TEXT("code=%s"), *Value));
+    }
+    else
+    {
+        double NumericCode = 0.0;
+        if (ErrorObject->TryGetNumberField(TEXT("code"), NumericCode))
+        {
+            Parts.Add(FString::Printf(TEXT("code=%.0f"), NumericCode));
+        }
+    }
+
+    if (ErrorObject->TryGetStringField(TEXT("status"), Value) && !Value.IsEmpty())
+    {
+        Parts.Add(FString::Printf(TEXT("status=%s"), *Value));
+    }
+
+    if (ErrorObject->TryGetStringField(TEXT("message"), Value) && !Value.IsEmpty())
+    {
+        Parts.Add(FString::Printf(TEXT("message=%s"), *Value));
+    }
+
+    if (ErrorObject->TryGetStringField(TEXT("param"), Value) && !Value.IsEmpty())
+    {
+        Parts.Add(FString::Printf(TEXT("param=%s"), *Value));
+    }
+
+    double Line = 0.0;
+    if (ErrorObject->TryGetNumberField(TEXT("line"), Line))
+    {
+        Parts.Add(FString::Printf(TEXT("line=%.0f"), Line));
+    }
+
+    return Parts.IsEmpty()
+        ? FString()
+        : TruncateDiagnostic(FString::Join(Parts, TEXT(", ")));
+}
+
+FString DescribeProviderErrorObject(const TSharedPtr<FJsonObject>& Root)
+{
+    if (!Root.IsValid())
+    {
+        return FString();
+    }
+
+    const TSharedPtr<FJsonObject>* Error = nullptr;
+    if (Root->TryGetObjectField(TEXT("error"), Error) && Error && Error->IsValid())
+    {
+        return DescribeErrorFields(*Error);
+    }
+
+    const TSharedPtr<FJsonObject>* Response = nullptr;
+    if (Root->TryGetObjectField(TEXT("response"), Response) && Response && Response->IsValid())
+    {
+        const TSharedPtr<FJsonObject>* ResponseError = nullptr;
+        if ((*Response)->TryGetObjectField(TEXT("error"), ResponseError) &&
+            ResponseError && ResponseError->IsValid())
+        {
+            return DescribeErrorFields(*ResponseError);
+        }
+    }
+
+    return FString();
+}
+
+FString DescribeHttpFailure(const FString& Body)
+{
+    const TSharedPtr<FJsonObject> Root = ParseObject(Body);
+    const FString Structured = DescribeProviderErrorObject(Root);
+    if (!Structured.IsEmpty())
+    {
+        return Structured;
+    }
+
+    const FString Raw = TruncateDiagnostic(Body);
+    return Raw.IsEmpty() ? TEXT("no response body") : Raw;
+}
+
+FString DescribeOpenAIBatchErrors(const TSharedPtr<FJsonObject>& Batch)
+{
+    if (!Batch.IsValid())
+    {
+        return FString();
+    }
+
+    const TSharedPtr<FJsonObject>* Errors = nullptr;
+    if (!Batch->TryGetObjectField(TEXT("errors"), Errors) || !Errors || !Errors->IsValid())
+    {
+        return FString();
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* Data = nullptr;
+    if (!(*Errors)->TryGetArrayField(TEXT("data"), Data) || !Data)
+    {
+        return DescribeErrorFields(*Errors);
+    }
+
+    TArray<FString> Details;
+    const int32 Count = FMath::Min(Data->Num(), MaxStructuredErrors);
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        const TSharedPtr<FJsonObject> Error = (*Data)[Index].IsValid()
+            ? (*Data)[Index]->AsObject()
+            : nullptr;
+        const FString Detail = DescribeErrorFields(Error);
+        if (!Detail.IsEmpty())
+        {
+            Details.Add(FString::Printf(TEXT("[%d] %s"), Index + 1, *Detail));
+        }
+    }
+
+    if (Data->Num() > MaxStructuredErrors)
+    {
+        Details.Add(FString::Printf(
+            TEXT("... %d additional error(s) omitted"),
+            Data->Num() - MaxStructuredErrors));
+    }
+
+    return Details.IsEmpty()
+        ? DescribeErrorFields(*Errors)
+        : TruncateDiagnostic(FString::Join(Details, TEXT(" | ")));
 }
 
 FString MakeErrorResponse(const FString& Message)
@@ -233,12 +383,15 @@ void FN2CNativeBatchProcessor::SendHttp(
                 RetryCount < N2CNativeBatchProcessorPrivate::MaxRateLimitRetries)
             {
                 const float Delay = N2CNativeBatchProcessorPrivate::RetryDelay(Response, RetryCount);
+                const FString Diagnostic =
+                    N2CNativeBatchProcessorPrivate::DescribeHttpFailure(ResponseBody);
                 FN2CLogger::Get().LogWarning(
                     FString::Printf(
-                        TEXT("Native batch HTTP 429 received. Retrying in %.2f seconds (retry %d/%d)"),
+                        TEXT("Native batch HTTP 429 received. Retrying in %.2f seconds (retry %d/%d). Provider response: %s"),
                         Delay,
                         RetryCount + 1,
-                        N2CNativeBatchProcessorPrivate::MaxRateLimitRetries),
+                        N2CNativeBatchProcessorPrivate::MaxRateLimitRetries,
+                        *Diagnostic),
                     TEXT("NativeBatch"));
 
                 FTSTicker::GetCoreTicker().AddTicker(
@@ -308,6 +461,20 @@ void FN2CNativeBatchProcessor::CompleteItemByCustomId(
         return;
     }
 
+    const FString ProviderError = N2CNativeBatchProcessorPrivate::DescribeProviderErrorObject(
+        N2CNativeBatchProcessorPrivate::ParseObject(RawResponse));
+    if (!ProviderError.IsEmpty())
+    {
+        FN2CLogger::Get().LogError(
+            FString::Printf(
+                TEXT("Native batch item %s (%s, model '%s') failed: %s"),
+                *CustomId,
+                *Request->RequestLabel,
+                *Config.Model,
+                *ProviderError),
+            TEXT("NativeBatch"));
+    }
+
     CompletedRequestIds.Add(Request->RequestId);
     if (OnItemComplete)
     {
@@ -332,6 +499,10 @@ void FN2CNativeBatchProcessor::CompleteItemByIndex(
 
 void FN2CNativeBatchProcessor::CompleteMissingItems(const FString& ErrorMessage)
 {
+    FN2CLogger::Get().LogError(
+        FString::Printf(TEXT("Native batch failure for model '%s': %s"), *Config.Model, *ErrorMessage),
+        TEXT("NativeBatch"));
+
     const FString ErrorResponse = N2CNativeBatchProcessorPrivate::MakeErrorResponse(ErrorMessage);
     for (const FN2CNativeBatchRequest& Request : Requests)
     {
@@ -401,7 +572,10 @@ void FN2CNativeBatchProcessor::StartOpenAIBatch()
         {
             if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(Status))
             {
-                Self->FallbackBeforeStart(FString::Printf(TEXT("OpenAI batch input upload failed (HTTP %d): %s"), Status, *Body.Left(2000)));
+                Self->FallbackBeforeStart(FString::Printf(
+                    TEXT("OpenAI batch input upload failed (HTTP %d): %s"),
+                    Status,
+                    *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(Body)));
                 return;
             }
 
@@ -409,7 +583,9 @@ void FN2CNativeBatchProcessor::StartOpenAIBatch()
             FString FileId;
             if (!Upload.IsValid() || !Upload->TryGetStringField(TEXT("id"), FileId) || FileId.IsEmpty())
             {
-                Self->FallbackBeforeStart(TEXT("OpenAI batch input upload did not return a file id"));
+                Self->FallbackBeforeStart(FString::Printf(
+                    TEXT("OpenAI batch input upload did not return a file id. Response: %s"),
+                    *N2CNativeBatchProcessorPrivate::TruncateDiagnostic(Body)));
                 return;
             }
 
@@ -428,7 +604,10 @@ void FN2CNativeBatchProcessor::StartOpenAIBatch()
                 {
                     if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(CreateStatus))
                     {
-                        Self->FallbackBeforeStart(FString::Printf(TEXT("OpenAI batch creation failed (HTTP %d): %s"), CreateStatus, *CreateBody.Left(2000)));
+                        Self->FallbackBeforeStart(FString::Printf(
+                            TEXT("OpenAI batch creation failed (HTTP %d): %s"),
+                            CreateStatus,
+                            *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(CreateBody)));
                         return;
                     }
 
@@ -436,7 +615,9 @@ void FN2CNativeBatchProcessor::StartOpenAIBatch()
                     FString BatchId;
                     if (!Batch.IsValid() || !Batch->TryGetStringField(TEXT("id"), BatchId) || BatchId.IsEmpty())
                     {
-                        Self->FallbackBeforeStart(TEXT("OpenAI batch creation did not return a batch id"));
+                        Self->FallbackBeforeStart(FString::Printf(
+                            TEXT("OpenAI batch creation did not return a batch id. Response: %s"),
+                            *N2CNativeBatchProcessorPrivate::TruncateDiagnostic(CreateBody)));
                         return;
                     }
 
@@ -465,7 +646,11 @@ void FN2CNativeBatchProcessor::PollOpenAIBatch(const FString& BatchId)
         {
             if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(Status))
             {
-                Self->CompleteMissingItems(FString::Printf(TEXT("OpenAI batch status request failed (HTTP %d)"), Status));
+                Self->CompleteMissingItems(FString::Printf(
+                    TEXT("OpenAI batch %s status request failed (HTTP %d): %s"),
+                    *BatchId,
+                    Status,
+                    *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(Body)));
                 Self->FinishBatch();
                 return;
             }
@@ -474,7 +659,10 @@ void FN2CNativeBatchProcessor::PollOpenAIBatch(const FString& BatchId)
             FString BatchStatus;
             if (!Batch.IsValid() || !Batch->TryGetStringField(TEXT("status"), BatchStatus))
             {
-                Self->CompleteMissingItems(TEXT("OpenAI batch status response was malformed"));
+                Self->CompleteMissingItems(FString::Printf(
+                    TEXT("OpenAI batch %s status response was malformed. Response: %s"),
+                    *BatchId,
+                    *N2CNativeBatchProcessorPrivate::TruncateDiagnostic(Body)));
                 Self->FinishBatch();
                 return;
             }
@@ -484,7 +672,16 @@ void FN2CNativeBatchProcessor::PollOpenAIBatch(const FString& BatchId)
                 FString OutputFileId;
                 if (!Batch->TryGetStringField(TEXT("output_file_id"), OutputFileId) || OutputFileId.IsEmpty())
                 {
-                    Self->CompleteMissingItems(TEXT("OpenAI batch completed without an output file"));
+                    const FString BatchErrors =
+                        N2CNativeBatchProcessorPrivate::DescribeOpenAIBatchErrors(Batch);
+                    Self->CompleteMissingItems(BatchErrors.IsEmpty()
+                        ? FString::Printf(
+                            TEXT("OpenAI batch %s completed without an output file"),
+                            *BatchId)
+                        : FString::Printf(
+                            TEXT("OpenAI batch %s completed without an output file: %s"),
+                            *BatchId,
+                            *BatchErrors));
                     Self->FinishBatch();
                     return;
                 }
@@ -495,7 +692,7 @@ void FN2CNativeBatchProcessor::PollOpenAIBatch(const FString& BatchId)
                     Headers,
                     FString(),
                     TEXT("application/json"),
-                    [Self](int32 OutputStatus, const FString& OutputBody, const FHttpResponsePtr&)
+                    [Self, BatchId](int32 OutputStatus, const FString& OutputBody, const FHttpResponsePtr&)
                     {
                         if (N2CNativeBatchProcessorPrivate::IsSuccessCode(OutputStatus))
                         {
@@ -503,7 +700,11 @@ void FN2CNativeBatchProcessor::PollOpenAIBatch(const FString& BatchId)
                         }
                         else
                         {
-                            Self->CompleteMissingItems(FString::Printf(TEXT("OpenAI batch output download failed (HTTP %d)"), OutputStatus));
+                            Self->CompleteMissingItems(FString::Printf(
+                                TEXT("OpenAI batch %s output download failed (HTTP %d): %s"),
+                                *BatchId,
+                                OutputStatus,
+                                *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(OutputBody)));
                         }
                         Self->FinishBatch();
                     });
@@ -513,7 +714,20 @@ void FN2CNativeBatchProcessor::PollOpenAIBatch(const FString& BatchId)
             if (BatchStatus == TEXT("failed") || BatchStatus == TEXT("expired") ||
                 BatchStatus == TEXT("cancelled"))
             {
-                Self->CompleteMissingItems(FString::Printf(TEXT("OpenAI batch ended with status '%s'"), *BatchStatus));
+                const FString BatchErrors =
+                    N2CNativeBatchProcessorPrivate::DescribeOpenAIBatchErrors(Batch);
+                Self->CompleteMissingItems(BatchErrors.IsEmpty()
+                    ? FString::Printf(
+                        TEXT("OpenAI batch %s ended with status '%s' for model '%s'"),
+                        *BatchId,
+                        *BatchStatus,
+                        *Self->Config.Model)
+                    : FString::Printf(
+                        TEXT("OpenAI batch %s ended with status '%s' for model '%s': %s"),
+                        *BatchId,
+                        *BatchStatus,
+                        *Self->Config.Model,
+                        *BatchErrors));
                 Self->FinishBatch();
                 return;
             }
@@ -609,7 +823,10 @@ void FN2CNativeBatchProcessor::StartAnthropicBatch()
         {
             if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(Status))
             {
-                Self->FallbackBeforeStart(FString::Printf(TEXT("Anthropic batch creation failed (HTTP %d)"), Status));
+                Self->FallbackBeforeStart(FString::Printf(
+                    TEXT("Anthropic batch creation failed (HTTP %d): %s"),
+                    Status,
+                    *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(Body)));
                 return;
             }
 
@@ -617,7 +834,9 @@ void FN2CNativeBatchProcessor::StartAnthropicBatch()
             FString BatchId;
             if (!Batch.IsValid() || !Batch->TryGetStringField(TEXT("id"), BatchId) || BatchId.IsEmpty())
             {
-                Self->FallbackBeforeStart(TEXT("Anthropic batch creation did not return a batch id"));
+                Self->FallbackBeforeStart(FString::Printf(
+                    TEXT("Anthropic batch creation did not return a batch id. Response: %s"),
+                    *N2CNativeBatchProcessorPrivate::TruncateDiagnostic(Body)));
                 return;
             }
 
@@ -647,7 +866,11 @@ void FN2CNativeBatchProcessor::PollAnthropicBatch(const FString& BatchId)
         {
             if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(Status))
             {
-                Self->CompleteMissingItems(FString::Printf(TEXT("Anthropic batch status request failed (HTTP %d)"), Status));
+                Self->CompleteMissingItems(FString::Printf(
+                    TEXT("Anthropic batch %s status request failed (HTTP %d): %s"),
+                    *BatchId,
+                    Status,
+                    *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(Body)));
                 Self->FinishBatch();
                 return;
             }
@@ -656,7 +879,10 @@ void FN2CNativeBatchProcessor::PollAnthropicBatch(const FString& BatchId)
             FString ProcessingStatus;
             if (!Batch.IsValid() || !Batch->TryGetStringField(TEXT("processing_status"), ProcessingStatus))
             {
-                Self->CompleteMissingItems(TEXT("Anthropic batch status response was malformed"));
+                Self->CompleteMissingItems(FString::Printf(
+                    TEXT("Anthropic batch %s status response was malformed. Response: %s"),
+                    *BatchId,
+                    *N2CNativeBatchProcessorPrivate::TruncateDiagnostic(Body)));
                 Self->FinishBatch();
                 return;
             }
@@ -669,7 +895,7 @@ void FN2CNativeBatchProcessor::PollAnthropicBatch(const FString& BatchId)
                     Headers,
                     FString(),
                     TEXT("application/json"),
-                    [Self](int32 ResultStatus, const FString& ResultBody, const FHttpResponsePtr&)
+                    [Self, BatchId](int32 ResultStatus, const FString& ResultBody, const FHttpResponsePtr&)
                     {
                         if (N2CNativeBatchProcessorPrivate::IsSuccessCode(ResultStatus))
                         {
@@ -677,7 +903,11 @@ void FN2CNativeBatchProcessor::PollAnthropicBatch(const FString& BatchId)
                         }
                         else
                         {
-                            Self->CompleteMissingItems(FString::Printf(TEXT("Anthropic batch results download failed (HTTP %d)"), ResultStatus));
+                            Self->CompleteMissingItems(FString::Printf(
+                                TEXT("Anthropic batch %s results download failed (HTTP %d): %s"),
+                                *BatchId,
+                                ResultStatus,
+                                *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(ResultBody)));
                         }
                         Self->FinishBatch();
                     });
@@ -808,7 +1038,10 @@ void FN2CNativeBatchProcessor::StartGeminiBatch()
         {
             if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(Status))
             {
-                Self->FallbackBeforeStart(FString::Printf(TEXT("Gemini batch creation failed (HTTP %d)"), Status));
+                Self->FallbackBeforeStart(FString::Printf(
+                    TEXT("Gemini batch creation failed (HTTP %d): %s"),
+                    Status,
+                    *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(Body)));
                 return;
             }
 
@@ -816,7 +1049,9 @@ void FN2CNativeBatchProcessor::StartGeminiBatch()
             FString BatchName;
             if (!BatchResource.IsValid() || !BatchResource->TryGetStringField(TEXT("name"), BatchName) || BatchName.IsEmpty())
             {
-                Self->FallbackBeforeStart(TEXT("Gemini batch creation did not return a batch name"));
+                Self->FallbackBeforeStart(FString::Printf(
+                    TEXT("Gemini batch creation did not return a batch name. Response: %s"),
+                    *N2CNativeBatchProcessorPrivate::TruncateDiagnostic(Body)));
                 return;
             }
 
@@ -844,7 +1079,11 @@ void FN2CNativeBatchProcessor::PollGeminiBatch(const FString& BatchName)
         {
             if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(Status))
             {
-                Self->CompleteMissingItems(FString::Printf(TEXT("Gemini batch status request failed (HTTP %d)"), Status));
+                Self->CompleteMissingItems(FString::Printf(
+                    TEXT("Gemini batch %s status request failed (HTTP %d): %s"),
+                    *BatchName,
+                    Status,
+                    *N2CNativeBatchProcessorPrivate::DescribeHttpFailure(Body)));
                 Self->FinishBatch();
                 return;
             }
@@ -852,7 +1091,10 @@ void FN2CNativeBatchProcessor::PollGeminiBatch(const FString& BatchName)
             const TSharedPtr<FJsonObject> BatchResource = N2CNativeBatchProcessorPrivate::ParseObject(Body);
             if (!BatchResource.IsValid())
             {
-                Self->CompleteMissingItems(TEXT("Gemini batch status response was malformed"));
+                Self->CompleteMissingItems(FString::Printf(
+                    TEXT("Gemini batch %s status response was malformed. Response: %s"),
+                    *BatchName,
+                    *N2CNativeBatchProcessorPrivate::TruncateDiagnostic(Body)));
                 Self->FinishBatch();
                 return;
             }
@@ -883,7 +1125,20 @@ void FN2CNativeBatchProcessor::PollGeminiBatch(const FString& BatchName)
 
             if (bFailed)
             {
-                Self->CompleteMissingItems(FString::Printf(TEXT("Gemini batch ended with state '%s'"), *State));
+                const FString ProviderError =
+                    N2CNativeBatchProcessorPrivate::DescribeProviderErrorObject(BatchResource);
+                Self->CompleteMissingItems(ProviderError.IsEmpty()
+                    ? FString::Printf(
+                        TEXT("Gemini batch %s ended with state '%s' for model '%s'"),
+                        *BatchName,
+                        *State,
+                        *Self->Config.Model)
+                    : FString::Printf(
+                        TEXT("Gemini batch %s ended with state '%s' for model '%s': %s"),
+                        *BatchName,
+                        *State,
+                        *Self->Config.Model,
+                        *ProviderError));
                 Self->FinishBatch();
                 return;
             }
