@@ -31,6 +31,10 @@
 
 namespace N2CLLMModuleSessionPrivate
 {
+constexpr int32 NativeBatchTargetEstimatedTokens = 64 * 1024;
+constexpr int32 NativeBatchEstimatedCharsPerToken = 3;
+constexpr int32 NativeBatchPerRequestOverheadTokens = 256;
+
 void MergeTranslationResponse(
     FN2CTranslationResponse& Target,
     const FN2CTranslationResponse& Source)
@@ -58,6 +62,124 @@ void MergeTranslationResponse(
     Target.Usage.InputTokens += Source.Usage.InputTokens;
     Target.Usage.OutputTokens += Source.Usage.OutputTokens;
 }
+
+int32 EstimateNativeBatchTokens(const FN2CPendingNativeBatchRequest& Request)
+{
+    // This is deliberately conservative and provider-agnostic. It is only an
+    // admission heuristic; provider-side capacity remains authoritative.
+    return FMath::Max(1, (Request.FormattedPayload.Len() + NativeBatchEstimatedCharsPerToken - 1) /
+        NativeBatchEstimatedCharsPerToken) + NativeBatchPerRequestOverheadTokens;
+}
+
+int64 EstimateNativeBatchTokens(const TArray<FN2CPendingNativeBatchRequest>& Requests)
+{
+    int64 Total = 0;
+    for (const FN2CPendingNativeBatchRequest& Request : Requests)
+    {
+        Total += EstimateNativeBatchTokens(Request);
+    }
+    return Total;
+}
+
+TArray<TArray<FN2CPendingNativeBatchRequest>> BuildNativeBatchChunks(
+    TArray<FN2CPendingNativeBatchRequest> Requests)
+{
+    TArray<TArray<FN2CPendingNativeBatchRequest>> Chunks;
+    TArray<FN2CPendingNativeBatchRequest> CurrentChunk;
+    int64 CurrentEstimatedTokens = 0;
+
+    for (FN2CPendingNativeBatchRequest& Request : Requests)
+    {
+        const int32 RequestEstimatedTokens = EstimateNativeBatchTokens(Request);
+        if (!CurrentChunk.IsEmpty() &&
+            CurrentEstimatedTokens + RequestEstimatedTokens > NativeBatchTargetEstimatedTokens)
+        {
+            Chunks.Add(MoveTemp(CurrentChunk));
+            CurrentChunk.Reset();
+            CurrentEstimatedTokens = 0;
+        }
+
+        CurrentEstimatedTokens += RequestEstimatedTokens;
+        CurrentChunk.Add(MoveTemp(Request));
+    }
+
+    if (!CurrentChunk.IsEmpty())
+    {
+        Chunks.Add(MoveTemp(CurrentChunk));
+    }
+
+    return Chunks;
+}
+
+bool IsNativeBatchAdmissionCapacityFailure(const FString& Reason)
+{
+    const FString LowerReason = Reason.ToLower();
+    return (LowerReason.Contains(TEXT("enqueued")) && LowerReason.Contains(TEXT("token"))) ||
+           LowerReason.Contains(TEXT("capacity")) ||
+           LowerReason.Contains(TEXT("batch is too large")) ||
+           LowerReason.Contains(TEXT("batch too large")) ||
+           LowerReason.Contains(TEXT("batch_size")) ||
+           LowerReason.Contains(TEXT("batch size")) ||
+           LowerReason.Contains(TEXT("payload too large")) ||
+           LowerReason.Contains(TEXT("request too large")) ||
+           LowerReason.Contains(TEXT("too many requests")) ||
+           LowerReason.Contains(TEXT("http 413"));
+}
+
+TArray<TArray<FN2CPendingNativeBatchRequest>> SplitNativeBatchChunk(
+    TArray<FN2CPendingNativeBatchRequest> Requests)
+{
+    TArray<TArray<FN2CPendingNativeBatchRequest>> Chunks;
+    if (Requests.Num() < 2)
+    {
+        Chunks.Add(MoveTemp(Requests));
+        return Chunks;
+    }
+
+    const int64 TotalEstimatedTokens = EstimateNativeBatchTokens(Requests);
+    int64 LeftEstimatedTokens = 0;
+    int64 BestDifference = -1;
+    int32 SplitIndex = 1;
+
+    for (int32 Index = 0; Index < Requests.Num() - 1; ++Index)
+    {
+        LeftEstimatedTokens += EstimateNativeBatchTokens(Requests[Index]);
+        const int64 Delta = TotalEstimatedTokens - (LeftEstimatedTokens * 2);
+        const int64 Difference = Delta < 0 ? -Delta : Delta;
+        if (BestDifference < 0 || Difference < BestDifference)
+        {
+            BestDifference = Difference;
+            SplitIndex = Index + 1;
+        }
+    }
+
+    TArray<FN2CPendingNativeBatchRequest> Left;
+    TArray<FN2CPendingNativeBatchRequest> Right;
+    Left.Reserve(SplitIndex);
+    Right.Reserve(Requests.Num() - SplitIndex);
+
+    for (int32 Index = 0; Index < Requests.Num(); ++Index)
+    {
+        if (Index < SplitIndex)
+        {
+            Left.Add(MoveTemp(Requests[Index]));
+        }
+        else
+        {
+            Right.Add(MoveTemp(Requests[Index]));
+        }
+    }
+
+    Chunks.Add(MoveTemp(Left));
+    Chunks.Add(MoveTemp(Right));
+    return Chunks;
+}
+
+struct FNativeBatchChunkDispatchState
+{
+    TArray<TArray<FN2CPendingNativeBatchRequest>> Chunks;
+    int32 NextChunkIndex = 0;
+};
 }
 
 UN2CLLMModule* UN2CLLMModule::Get()
@@ -232,67 +354,172 @@ void UN2CLLMModule::FlushNativeBatchRequests()
         return;
     }
 
-    TSharedRef<TArray<FN2CPendingNativeBatchRequest>> PendingRef =
-        MakeShared<TArray<FN2CPendingNativeBatchRequest>>(MoveTemp(Pending));
+    const int32 TotalRequestCount = Pending.Num();
+    const int64 TotalEstimatedTokens = N2CLLMModuleSessionPrivate::EstimateNativeBatchTokens(Pending);
+    TSharedRef<N2CLLMModuleSessionPrivate::FNativeBatchChunkDispatchState> State =
+        MakeShared<N2CLLMModuleSessionPrivate::FNativeBatchChunkDispatchState>();
+    State->Chunks = N2CLLMModuleSessionPrivate::BuildNativeBatchChunks(MoveTemp(Pending));
 
-    TArray<FN2CNativeBatchRequest> NativeRequests;
-    NativeRequests.Reserve(PendingRef->Num());
-    for (const FN2CPendingNativeBatchRequest& Item : *PendingRef)
-    {
-        FN2CNativeBatchRequest Native;
-        Native.RequestId = Item.RequestId;
-        Native.RequestLabel = Item.RequestLabel;
-        Native.FormattedPayload = Item.FormattedPayload;
-        NativeRequests.Add(MoveTemp(Native));
-    }
+    FN2CLogger::Get().Log(
+        FString::Printf(
+            TEXT("Prepared %d provider-native batch chunk(s) from %d requests (~%lld estimated input tokens; target <= %d per chunk)"),
+            State->Chunks.Num(),
+            TotalRequestCount,
+            static_cast<long long>(TotalEstimatedTokens),
+            N2CLLMModuleSessionPrivate::NativeBatchTargetEstimatedTokens),
+        EN2CLogSeverity::Info,
+        TEXT("NativeBatch"));
 
     TWeakObjectPtr<UN2CLLMModule> WeakThis(this);
-    TSharedRef<FN2CNativeBatchProcessor> Processor = FN2CNativeBatchProcessor::Create(
-        Config,
-        MoveTemp(NativeRequests),
-        [WeakThis, PendingRef](const FN2CNativeBatchResult& Result)
+    TSharedRef<TFunction<void()>> DispatchNext = MakeShared<TFunction<void()>>();
+    TWeakPtr<TFunction<void()>> WeakDispatchNext = DispatchNext;
+
+    *DispatchNext = [WeakThis, State, WeakDispatchNext]() mutable
+    {
+        UN2CLLMModule* StrongThis = WeakThis.Get();
+        TSharedPtr<TFunction<void()>> Dispatch = WeakDispatchNext.Pin();
+        if (!StrongThis || !Dispatch.IsValid())
         {
-            UN2CLLMModule* StrongThis = WeakThis.Get();
-            if (!StrongThis)
+            return;
+        }
+
+        while (State->NextChunkIndex < State->Chunks.Num())
+        {
+            TArray<FN2CPendingNativeBatchRequest> Chunk =
+                MoveTemp(State->Chunks[State->NextChunkIndex++]);
+            if (Chunk.IsEmpty())
             {
-                return;
+                continue;
             }
 
-            const FN2CPendingNativeBatchRequest* PendingItem = PendingRef->FindByPredicate(
-                [&Result](const FN2CPendingNativeBatchRequest& Candidate)
-                {
-                    return Candidate.RequestId == Result.RequestId;
-                });
-
-            if (!PendingItem)
+            if (Chunk.Num() < 2)
             {
-                return;
+                StrongThis->DispatchPendingBatchIndividually(
+                    MoveTemp(Chunk),
+                    TEXT("Admission chunk contains only one request"));
+                continue;
             }
 
-            StrongThis->HandleCompletedBatchItem(
-                Result.RequestId,
-                Result.RequestLabel,
-                Result.FormattedPayload,
-                Result.RawResponse,
-                PendingItem->OnComplete);
-        },
-        []()
-        {
+            TSharedRef<TArray<FN2CPendingNativeBatchRequest>> PendingRef =
+                MakeShared<TArray<FN2CPendingNativeBatchRequest>>(MoveTemp(Chunk));
+
+            TArray<FN2CNativeBatchRequest> NativeRequests;
+            NativeRequests.Reserve(PendingRef->Num());
+            for (const FN2CPendingNativeBatchRequest& Item : *PendingRef)
+            {
+                FN2CNativeBatchRequest Native;
+                Native.RequestId = Item.RequestId;
+                Native.RequestLabel = Item.RequestLabel;
+                Native.FormattedPayload = Item.FormattedPayload;
+                NativeRequests.Add(MoveTemp(Native));
+            }
+
+            const int64 ChunkEstimatedTokens =
+                N2CLLMModuleSessionPrivate::EstimateNativeBatchTokens(*PendingRef);
             FN2CLogger::Get().Log(
-                TEXT("Provider-native batch result collection completed"),
+                FString::Printf(
+                    TEXT("Submitting provider-native batch chunk with %d requests (~%lld estimated input tokens); %d chunk(s) remain queued"),
+                    PendingRef->Num(),
+                    static_cast<long long>(ChunkEstimatedTokens),
+                    State->Chunks.Num() - State->NextChunkIndex),
                 EN2CLogSeverity::Info,
                 TEXT("NativeBatch"));
-        },
-        [WeakThis, PendingRef](const FString& Reason)
-        {
-            if (UN2CLLMModule* StrongThis = WeakThis.Get())
-            {
-                TArray<FN2CPendingNativeBatchRequest> FallbackRequests = MoveTemp(*PendingRef);
-                StrongThis->DispatchPendingBatchIndividually(MoveTemp(FallbackRequests), Reason);
-            }
-        });
 
-    Processor->Start();
+            TSharedRef<FN2CNativeBatchProcessor> Processor = FN2CNativeBatchProcessor::Create(
+                StrongThis->Config,
+                MoveTemp(NativeRequests),
+                [WeakThis, PendingRef](const FN2CNativeBatchResult& Result)
+                {
+                    UN2CLLMModule* ItemOwner = WeakThis.Get();
+                    if (!ItemOwner)
+                    {
+                        return;
+                    }
+
+                    const FN2CPendingNativeBatchRequest* PendingItem = PendingRef->FindByPredicate(
+                        [&Result](const FN2CPendingNativeBatchRequest& Candidate)
+                        {
+                            return Candidate.RequestId == Result.RequestId;
+                        });
+
+                    if (!PendingItem)
+                    {
+                        return;
+                    }
+
+                    ItemOwner->HandleCompletedBatchItem(
+                        Result.RequestId,
+                        Result.RequestLabel,
+                        Result.FormattedPayload,
+                        Result.RawResponse,
+                        PendingItem->OnComplete);
+                },
+                [WeakThis, Dispatch]()
+                {
+                    if (WeakThis.IsValid())
+                    {
+                        FN2CLogger::Get().Log(
+                            TEXT("Provider-native batch chunk result collection completed"),
+                            EN2CLogSeverity::Info,
+                            TEXT("NativeBatch"));
+                        (*Dispatch)();
+                    }
+                },
+                [WeakThis, PendingRef, State, Dispatch](const FString& Reason) mutable
+                {
+                    UN2CLLMModule* BatchOwner = WeakThis.Get();
+                    if (!BatchOwner)
+                    {
+                        return;
+                    }
+
+                    if (N2CLLMModuleSessionPrivate::IsNativeBatchAdmissionCapacityFailure(Reason) &&
+                        PendingRef->Num() >= 2)
+                    {
+                        const int32 OriginalRequestCount = PendingRef->Num();
+                        const int64 OriginalEstimatedTokens =
+                            N2CLLMModuleSessionPrivate::EstimateNativeBatchTokens(*PendingRef);
+                        TArray<TArray<FN2CPendingNativeBatchRequest>> SmallerChunks =
+                            N2CLLMModuleSessionPrivate::SplitNativeBatchChunk(MoveTemp(*PendingRef));
+
+                        if (SmallerChunks.Num() > 1)
+                        {
+                            const int32 InsertIndex = State->NextChunkIndex;
+                            const int32 SmallerChunkCount = SmallerChunks.Num();
+                            for (int32 Index = SmallerChunks.Num() - 1; Index >= 0; --Index)
+                            {
+                                State->Chunks.Insert(MoveTemp(SmallerChunks[Index]), InsertIndex);
+                            }
+
+                            FN2CLogger::Get().LogWarning(
+                                FString::Printf(
+                                    TEXT("Native batch admission rejected for %d requests (~%lld estimated tokens); split into %d smaller chunk(s) and will retry sequentially. Provider response: %s"),
+                                    OriginalRequestCount,
+                                    static_cast<long long>(OriginalEstimatedTokens),
+                                    SmallerChunkCount,
+                                    *Reason),
+                                TEXT("NativeBatch"));
+                            (*Dispatch)();
+                            return;
+                        }
+                    }
+
+                    TArray<FN2CPendingNativeBatchRequest> FallbackRequests = MoveTemp(*PendingRef);
+                    BatchOwner->DispatchPendingBatchIndividually(MoveTemp(FallbackRequests), Reason);
+                    (*Dispatch)();
+                });
+
+            Processor->Start();
+            return;
+        }
+
+        FN2CLogger::Get().Log(
+            TEXT("Provider-native batch chunk sequence completed"),
+            EN2CLogSeverity::Info,
+            TEXT("NativeBatch"));
+    };
+
+    (*DispatchNext)();
 }
 
 void UN2CLLMModule::DispatchPendingBatchIndividually(
