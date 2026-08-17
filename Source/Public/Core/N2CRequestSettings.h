@@ -100,6 +100,18 @@ public:
         const TArray<EN2CLLMProvider>& AvailableProviders,
         FN2CResolvedRequestProvider& OutProvider);
 
+    /**
+     * Resolve a provider/model for an existing request retry without changing the operation's
+     * ad-hoc instructions or attached context. The model field is editable so the retry may target
+     * a different model than the provider/profile's saved default.
+     */
+    static bool ResolveProviderForRetry(
+        EN2CLLMProvider DefaultProvider,
+        const FString& DefaultCustomProviderName,
+        const FString& DefaultModel,
+        const TArray<EN2CLLMProvider>& AvailableProviders,
+        FN2CResolvedRequestProvider& OutProvider);
+
     /** Consume the named custom provider selected for this request, if any. */
     static FString ConsumeSelectedCustomProviderName();
 

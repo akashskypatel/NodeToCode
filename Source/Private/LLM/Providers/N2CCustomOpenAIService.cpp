@@ -12,7 +12,15 @@
 bool UN2CCustomOpenAIService::Initialize(const FN2CLLMConfig& InConfig)
 {
     const UN2CCustomProviderSettings* Settings = GetDefault<UN2CCustomProviderSettings>();
-    const FString RequestProviderName = FN2CRequestRuntime::ConsumeSelectedCustomProviderName();
+
+    // Consume the legacy runtime selection even when the config already carries a profile name so
+    // no stale selection can leak into a later request. Transient resend services pass the profile
+    // explicitly through FN2CLLMConfig and therefore do not depend on global picker state.
+    const FString RuntimeProviderName = FN2CRequestRuntime::ConsumeSelectedCustomProviderName();
+    const FString RequestProviderName = !InConfig.CustomProviderName.TrimStartAndEnd().IsEmpty()
+        ? InConfig.CustomProviderName.TrimStartAndEnd()
+        : RuntimeProviderName;
+
     const FN2CCustomProviderDefinition* Provider = Settings
         ? (RequestProviderName.IsEmpty()
             ? Settings->GetActiveProvider()
@@ -52,8 +60,11 @@ bool UN2CCustomOpenAIService::Initialize(const FN2CLLMConfig& InConfig)
         ? BaseUrl
         : BaseUrl + TEXT("/chat/completions");
     UpdatedConfig.ApiKey = Settings->GetApiKey(Provider->Name);
-    UpdatedConfig.Model = Provider->Model;
+    UpdatedConfig.Model = InConfig.Model.TrimStartAndEnd().IsEmpty()
+        ? Provider->Model
+        : InConfig.Model.TrimStartAndEnd();
     UpdatedConfig.bUseSystemPrompts = Provider->bUseSystemPrompts;
+    UpdatedConfig.CustomProviderName = Provider->Name;
 
     FN2CLogger::Get().Log(
         FString::Printf(

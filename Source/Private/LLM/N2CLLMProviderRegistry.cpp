@@ -42,8 +42,6 @@ TScriptInterface<IN2CLLMService> UN2CLLMProviderRegistry::CreateProvider(
     EN2CLLMProvider ProviderType,
     UObject* Outer)
 {
-    TScriptInterface<IN2CLLMService> Result;
-
     EN2CLLMProvider EffectiveProvider = ProviderType;
 
     // Translation requests are created with the LLM module as their outer. Resolve a transient
@@ -60,53 +58,51 @@ TScriptInterface<IN2CLLMService> UN2CLLMProviderRegistry::CreateProvider(
                 TEXT("LLM provider creation cancelled before request dispatch"),
                 EN2CLogSeverity::Info,
                 TEXT("LLMProviderRegistry"));
-            return Result;
+            return TScriptInterface<IN2CLLMService>();
         }
 
         EffectiveProvider = ResolvedProvider.Provider;
         LLMModule->ApplyRequestProviderOverride(
             ResolvedProvider.Provider,
             ResolvedProvider.ApiKey,
-            ResolvedProvider.Model);
+            ResolvedProvider.Model,
+            ResolvedProvider.CustomProviderName);
     }
-    
-    // Find the provider class after resolving any per-request override.
-    TSubclassOf<UN2CBaseLLMService>* ProviderClassPtr = ProviderClasses.Find(EffectiveProvider);
+
+    return CreateProviderDirect(EffectiveProvider, Outer);
+}
+
+TScriptInterface<IN2CLLMService> UN2CLLMProviderRegistry::CreateProviderDirect(
+    EN2CLLMProvider ProviderType,
+    UObject* Outer)
+{
+    TScriptInterface<IN2CLLMService> Result;
+
+    TSubclassOf<UN2CBaseLLMService>* ProviderClassPtr = ProviderClasses.Find(ProviderType);
     if (!ProviderClassPtr || !(*ProviderClassPtr))
     {
         FN2CLogger::Get().LogError(
-            FString::Printf(TEXT("Provider type not registered: %s"), 
-                *UEnum::GetValueAsString(EffectiveProvider)),
-            TEXT("LLMProviderRegistry")
-        );
+            FString::Printf(TEXT("Provider type not registered: %s"),
+                *UEnum::GetValueAsString(ProviderType)),
+            TEXT("LLMProviderRegistry"));
         return Result;
     }
-    
-    // Create the provider object
-    UObject* ServiceObject = nullptr;
-    if (Outer)
-    {
-        ServiceObject = NewObject<UObject>(Outer, *ProviderClassPtr);
-    }
-    else
-    {
-        ServiceObject = NewObject<UObject>(*ProviderClassPtr);
-    }
-    
+
+    UObject* ServiceObject = Outer
+        ? NewObject<UObject>(Outer, *ProviderClassPtr)
+        : NewObject<UObject>(*ProviderClassPtr);
+
     if (!ServiceObject)
     {
         FN2CLogger::Get().LogError(
-            FString::Printf(TEXT("Failed to create service object for provider type: %s"), 
-                *UEnum::GetValueAsString(EffectiveProvider)),
-            TEXT("LLMProviderRegistry")
-        );
+            FString::Printf(TEXT("Failed to create service object for provider type: %s"),
+                *UEnum::GetValueAsString(ProviderType)),
+            TEXT("LLMProviderRegistry"));
         return Result;
     }
-    
-    // Set up the interface
+
     Result.SetObject(ServiceObject);
     Result.SetInterface(Cast<IN2CLLMService>(ServiceObject));
-    
     return Result;
 }
 

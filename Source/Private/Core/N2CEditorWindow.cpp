@@ -1,12 +1,14 @@
 // Copyright (c) 2025 Nick McClure (Protospatial). All Rights Reserved.
 
 #include "Core/N2CEditorWindow.h"
+#include "Core/N2CRequestSettings.h"
 #include "Core/N2CTranslationHistoryWindow.h"
 #include "Core/N2CWidgetContainer.h"
 #include "EditorUtilityWidget.h"
 #include "EditorUtilityWidgetBlueprint.h"
 #include "Framework/Application/SlateApplication.h"
 #include "LLM/N2CLLMModule.h"
+#include "LLM/N2CLLMProviderRegistry.h"
 #include "Utils/N2CLogger.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Images/SThrobber.h"
@@ -292,7 +294,7 @@ FReply OpenRawResponseViewer()
                 .ToolTipText(NSLOCTEXT(
                     "NodeToCode",
                     "ResendRawRequestToolTip",
-                    "Replace this request's response in place. Graph requests replay their captured body; Final Consolidation is rebuilt from the latest successfully parsed graph responses and waits for any in-progress resends first."))
+                    "Choose a provider/model and replace this request's response in place. Graph requests preserve the original semantic prompt while being reformatted for the selected provider. Final Consolidation is rebuilt from the latest parsed graph responses and waits for in-progress resends first."))
                 .IsEnabled_Lambda([State]()
                 {
                     if (!State->SelectedItem.IsValid())
@@ -300,7 +302,9 @@ FReply OpenRawResponseViewer()
                         return false;
                     }
                     const FN2CRawResponseRecord& Record = State->SelectedItem->Record;
-                    return (Record.bFinalConsolidation || !Record.RawRequest.IsEmpty()) &&
+                    return (Record.bFinalConsolidation ||
+                            !Record.RawRequest.IsEmpty() ||
+                            !Record.SourceRequestPayload.IsEmpty()) &&
                            !State->RetryRequestIds.Contains(Record.RequestId);
                 })
                 .OnClicked_Lambda([State, ViewerWindow]()
@@ -310,16 +314,50 @@ FReply OpenRawResponseViewer()
                         return FReply::Handled();
                     }
 
-                    const int32 RequestId = State->SelectedItem->Record.RequestId;
-                    const bool bConsolidation = State->SelectedItem->Record.bFinalConsolidation;
+                    UN2CLLMModule* Module = UN2CLLMModule::Get();
+                    const FN2CRawResponseRecord Record = State->SelectedItem->Record;
+
+                    FString DefaultCustomProviderName = Record.CustomProviderName;
+                    const FN2CLLMConfig& ActiveConfig = Module->GetConfig();
+                    if (DefaultCustomProviderName.IsEmpty() &&
+                        ActiveConfig.Provider == Record.Provider &&
+                        ActiveConfig.Model.Equals(Record.Model, ESearchCase::IgnoreCase))
+                    {
+                        DefaultCustomProviderName = ActiveConfig.CustomProviderName;
+                    }
+
+                    FN2CResolvedRequestProvider SelectedProvider;
+                    if (!FN2CRequestRuntime::ResolveProviderForRetry(
+                            Record.Provider,
+                            DefaultCustomProviderName,
+                            Record.Model,
+                            UN2CLLMProviderRegistry::Get()->GetRegisteredProviders(),
+                            SelectedProvider))
+                    {
+                        State->StatusText = TEXT("Resend cancelled.");
+                        return FReply::Handled();
+                    }
+
+                    FN2CLLMConfig RetryConfig = ActiveConfig;
+                    RetryConfig.Provider = SelectedProvider.Provider;
+                    RetryConfig.ApiEndpoint.Empty();
+                    RetryConfig.ApiKey = SelectedProvider.ApiKey;
+                    RetryConfig.Model = SelectedProvider.Model;
+                    RetryConfig.CustomProviderName = SelectedProvider.CustomProviderName;
+                    RetryConfig.bUseSystemPrompts = true;
+
+                    const int32 RequestId = Record.RequestId;
                     State->RetryRequestIds.Add(RequestId);
-                    State->StatusText = bConsolidation
-                        ? TEXT("Waiting for in-progress requests if necessary, then rebuilding and resending Final Consolidation...")
-                        : FString::Printf(TEXT("Resending request #%d and waiting for a replacement response..."), RequestId);
+                    State->StatusText = FString::Printf(
+                        TEXT("Resending request #%d using %s / %s..."),
+                        RequestId,
+                        *GetRawResponseProviderDisplayName(RetryConfig.Provider),
+                        *RetryConfig.Model);
 
                     const TWeakPtr<SWindow> WeakViewerWindow = ViewerWindow;
-                    const bool bStarted = UN2CLLMModule::Get()->ResendRawRequest(
+                    const bool bStarted = Module->ResendRawRequest(
                         RequestId,
+                        RetryConfig,
                         [State, WeakViewerWindow, RequestId](bool bSuccess)
                         {
                             State->RetryRequestIds.Remove(RequestId);
@@ -327,19 +365,17 @@ FReply OpenRawResponseViewer()
                                 ? TEXT("Replacement response completed and parsed successfully.")
                                 : TEXT("Replacement response completed but did not parse successfully.");
 
-                            if (!WeakViewerWindow.IsValid())
+                            if (WeakViewerWindow.IsValid())
                             {
-                                return;
+                                RefreshN2CRawResponseViewer(State, RequestId);
                             }
-
-                            RefreshN2CRawResponseViewer(State, RequestId);
                         });
 
                     if (!bStarted)
                     {
                         State->RetryRequestIds.Remove(RequestId);
                         State->StatusText =
-                            TEXT("Unable to resend this request. It may already be queued/in progress or the active provider/model no longer matches it.");
+                            TEXT("Unable to resend this request. It may already be queued/in progress or the selected provider could not be initialized.");
                     }
 
                     return FReply::Handled();
@@ -525,7 +561,7 @@ void SN2CEditorWindow::Construct(const FArguments& InArgs)
                     .ToolTipText(NSLOCTEXT(
                         "NodeToCode",
                         "RawResponsesToolTip",
-                        "View the request body and formatted provider response for any request in the current translation session, and optionally replace/re-parse it."))
+                        "View the request body and formatted provider response for any request in the current translation session, and optionally replace/re-parse it through a selected provider/model."))
                     .IsEnabled_Lambda([]()
                     {
                         return UN2CLLMModule::Get()->GetRawResponseCount() > 0;

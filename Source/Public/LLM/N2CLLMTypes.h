@@ -43,6 +43,10 @@ struct FN2CRawResponseRecord
     UPROPERTY(BlueprintReadOnly, Category = "Node to Code | LLM Module")
     EN2CLLMProvider Provider = EN2CLLMProvider::Anthropic;
 
+    /** Named custom/saved profile used for the request, when applicable. */
+    UPROPERTY(BlueprintReadOnly, Category = "Node to Code | LLM Module")
+    FString CustomProviderName;
+
     UPROPERTY(BlueprintReadOnly, Category = "Node to Code | LLM Module")
     FString Model;
 
@@ -52,6 +56,14 @@ struct FN2CRawResponseRecord
     /** Exact provider-specific POST body that was sent. Authorization headers are not stored. */
     UPROPERTY(BlueprintReadOnly, Category = "Node to Code | LLM Module")
     FString RawRequest;
+
+    /** Prepared semantic user content retained for future cross-provider retries. */
+    UPROPERTY(BlueprintReadOnly, Category = "Node to Code | LLM Module")
+    FString SourceRequestPayload;
+
+    /** Prepared semantic system content paired with SourceRequestPayload. */
+    UPROPERTY(BlueprintReadOnly, Category = "Node to Code | LLM Module")
+    FString SourceSystemPrompt;
 
     UPROPERTY(BlueprintReadOnly, Category = "Node to Code | LLM Module")
     FString FormattedResponse;
@@ -104,4 +116,8 @@ struct FN2CLLMConfig
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LLM Integration")
     FString Model;
+
+    /** Named custom/saved provider profile used to resolve provider-specific settings. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LLM Integration")
+    FString CustomProviderName;
 };

@@ -6,6 +6,7 @@
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -111,7 +112,10 @@ bool FN2CBatchTranslationConsolidator::BuildRequestPayload(
     UsageObject->SetNumberField(TEXT("output_tokens"), SessionResponse.Usage.OutputTokens);
     RequestObject->SetObjectField(TEXT("prior_translation_usage"), UsageObject);
 
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutPayload);
+    // Use a compact wire representation. This removes indentation/newline tokens only; the exact
+    // source Blueprint and parsed translation fields remain present with identical JSON semantics.
+    TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutPayload);
     if (!FJsonSerializer::Serialize(RequestObject.ToSharedRef(), Writer) || OutPayload.IsEmpty())
     {
         FN2CLogger::Get().LogError(

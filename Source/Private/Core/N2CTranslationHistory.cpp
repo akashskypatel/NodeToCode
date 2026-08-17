@@ -11,7 +11,7 @@
 
 namespace N2CTranslationHistoryPrivate
 {
-constexpr int32 HistoryVersion = 1;
+constexpr int32 HistoryVersion = 2;
 const TCHAR* HistoryFileName = TEXT("N2C_RequestHistory.json");
 
 TSharedPtr<FJsonObject> RecordToJson(const FN2CRawResponseRecord& Record)
@@ -21,9 +21,12 @@ TSharedPtr<FJsonObject> RecordToJson(const FN2CRawResponseRecord& Record)
     Object->SetStringField(TEXT("request_label"), Record.RequestLabel);
     Object->SetNumberField(TEXT("provider_value"), static_cast<uint8>(Record.Provider));
     Object->SetStringField(TEXT("provider"), UEnum::GetValueAsString(Record.Provider));
+    Object->SetStringField(TEXT("custom_provider_name"), Record.CustomProviderName);
     Object->SetStringField(TEXT("model"), Record.Model);
     Object->SetStringField(TEXT("timestamp"), Record.Timestamp);
     Object->SetStringField(TEXT("raw_request"), Record.RawRequest);
+    Object->SetStringField(TEXT("source_request_payload"), Record.SourceRequestPayload);
+    Object->SetStringField(TEXT("source_system_prompt"), Record.SourceSystemPrompt);
     Object->SetStringField(TEXT("formatted_response"), Record.FormattedResponse);
     Object->SetBoolField(TEXT("parsed_successfully"), Record.bParsedSuccessfully);
     Object->SetNumberField(TEXT("retried_from_request_id"), Record.RetriedFromRequestId);
@@ -42,9 +45,12 @@ bool JsonToRecord(const TSharedPtr<FJsonObject>& Object, FN2CRawResponseRecord& 
     Object->TryGetNumberField(TEXT("request_id"), NumberValue);
     OutRecord.RequestId = static_cast<int32>(NumberValue);
     Object->TryGetStringField(TEXT("request_label"), OutRecord.RequestLabel);
+    Object->TryGetStringField(TEXT("custom_provider_name"), OutRecord.CustomProviderName);
     Object->TryGetStringField(TEXT("model"), OutRecord.Model);
     Object->TryGetStringField(TEXT("timestamp"), OutRecord.Timestamp);
     Object->TryGetStringField(TEXT("raw_request"), OutRecord.RawRequest);
+    Object->TryGetStringField(TEXT("source_request_payload"), OutRecord.SourceRequestPayload);
+    Object->TryGetStringField(TEXT("source_system_prompt"), OutRecord.SourceSystemPrompt);
     Object->TryGetStringField(TEXT("formatted_response"), OutRecord.FormattedResponse);
     Object->TryGetBoolField(TEXT("parsed_successfully"), OutRecord.bParsedSuccessfully);
     Object->TryGetBoolField(TEXT("final_consolidation"), OutRecord.bFinalConsolidation);

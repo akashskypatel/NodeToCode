@@ -37,6 +37,14 @@ public:
         const FString& JsonPayload,
         const FString& SystemMessage);
 
+    /**
+     * Format already-prepared semantic messages for this provider without rebuilding the original
+     * custom/ad-hoc prompt content. Used by cross-provider request retries.
+     */
+    FString BuildFormattedRequestPayloadFromPreparedMessages(
+        const FString& UserMessage,
+        const FString& SystemMessage);
+
     /** Replay an already formatted provider request body without rebuilding prompts/context. */
     void ResendFormattedRequest(
         const FString& FormattedPayload,

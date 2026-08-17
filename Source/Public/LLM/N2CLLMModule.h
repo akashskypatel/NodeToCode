@@ -10,6 +10,8 @@
 #include "Models/N2CBlueprint.h"
 #include "N2CLLMModule.generated.h"
 
+class UN2CBaseLLMService;
+
 struct FN2CPendingNativeBatchRequest
 {
     int32 RequestId = 0;
@@ -55,12 +57,14 @@ public:
     void ApplyRequestProviderOverride(
         EN2CLLMProvider Provider,
         const FString& ApiKey,
-        const FString& Model)
+        const FString& Model,
+        const FString& CustomProviderName = FString())
     {
         Config.Provider = Provider;
         Config.ApiEndpoint.Empty();
         Config.ApiKey = ApiKey;
         Config.Model = Model;
+        Config.CustomProviderName = CustomProviderName;
         Config.bUseSystemPrompts = true;
     }
 
@@ -102,6 +106,12 @@ public:
     /** Replay a captured provider request and replace that request's existing history/result in place. */
     bool ResendRawRequest(
         int32 RequestId,
+        TFunction<void(bool)> OnComplete = TFunction<void(bool)>());
+
+    /** Replay a captured request through an explicitly selected provider/model. */
+    bool ResendRawRequest(
+        int32 RequestId,
+        const FN2CLLMConfig& RetryConfig,
         TFunction<void(bool)> OnComplete = TFunction<void(bool)>());
 
     /** Aggregate parsed response for the current translation session. */
@@ -157,6 +167,16 @@ private:
         int32 ExistingRequestId = INDEX_NONE,
         TFunction<void(bool)> OnComplete = TFunction<void(bool)>());
     void StartQueuedConsolidationIfReady();
+
+    /** Start a replacement consolidation through an explicitly selected transient provider/model. */
+    bool StartFinalConsolidationWithConfig(
+        int32 ExistingRequestId,
+        const FN2CLLMConfig& RequestConfig,
+        TFunction<void(bool)> OnComplete);
+
+    /** Create/release an isolated provider service for one selected retry. */
+    TScriptInterface<IN2CLLMService> CreateTransientService(const FN2CLLMConfig& ServiceConfig);
+    void ReleaseTransientService(UObject* ServiceObject);
 
     /** Persist current raw request/response history into the active/latest translation batch. */
     void PersistRequestHistory() const;
@@ -221,6 +241,10 @@ private:
 
     /** Active LLM service */
     TScriptInterface<class IN2CLLMService> ActiveService;
+
+    /** Keep transient retry services alive until their asynchronous request completes. */
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<UN2CBaseLLMService>> RetryServiceObjects;
 
     /** Current system status */
     UPROPERTY()
