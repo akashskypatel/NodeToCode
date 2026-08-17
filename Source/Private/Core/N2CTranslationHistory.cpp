@@ -85,11 +85,11 @@ bool FN2CTranslationHistory::SaveRequestHistory(const FString& BatchDirectory, c
     RequestValues.Reserve(Records.Num());
     for (const FN2CRawResponseRecord& Record : Records)
     {
-        RequestValues.Add(MakeShared<FJsonValueObject>(RecordToJson(Record)));
+        RequestValues.Add(MakeShared<FJsonValueObject>(N2CTranslationHistoryPrivate::RecordToJson(Record)));
     }
 
     TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
-    Root->SetNumberField(TEXT("version"), HistoryVersion);
+    Root->SetNumberField(TEXT("version"), N2CTranslationHistoryPrivate::HistoryVersion);
     Root->SetArrayField(TEXT("requests"), RequestValues);
 
     FString Json;
@@ -126,7 +126,7 @@ bool FN2CTranslationHistory::LoadRequestHistory(const FString& BatchDirectory, T
     for (const TSharedPtr<FJsonValue>& Value : *RequestValues)
     {
         FN2CRawResponseRecord Record;
-        if (Value.IsValid() && JsonToRecord(Value->AsObject(), Record))
+        if (Value.IsValid() && N2CTranslationHistoryPrivate::JsonToRecord(Value->AsObject(), Record))
         {
             OutRecords.Add(MoveTemp(Record));
         }
