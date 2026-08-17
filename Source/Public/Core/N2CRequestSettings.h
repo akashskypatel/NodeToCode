@@ -55,6 +55,40 @@ class NODETOCODE_API UN2CRequestSettings : public UDeveloperSettings
     GENERATED_BODY()
 
 public:
+    /** Use Anthropic's native batch API for compatible whole-Blueprint translations. */
+    UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "Node to Code | LLM Services | Anthropic",
+        meta = (DisplayName = "Use Batch Processing",
+                ToolTip = "Submit compatible whole-Blueprint translation requests through Anthropic's native batch API. Disabled by default."))
+    bool bAnthropicUseBatchProcessing = false;
+
+    /** Use OpenAI's native Batch API for compatible whole-Blueprint translations. */
+    UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "Node to Code | LLM Services | OpenAI",
+        meta = (DisplayName = "Use Batch Processing",
+                ToolTip = "Submit compatible whole-Blueprint translation requests through OpenAI's native Batch API. Disabled by default."))
+    bool bOpenAIUseBatchProcessing = false;
+
+    /** Use Gemini's native batch API for compatible whole-Blueprint translations. */
+    UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "Node to Code | LLM Services | Gemini",
+        meta = (DisplayName = "Use Batch Processing",
+                ToolTip = "Submit compatible whole-Blueprint translation requests through Gemini's native batch API. Disabled by default."))
+    bool bGeminiUseBatchProcessing = false;
+
+    /** Whether native batch processing is enabled for the selected built-in provider. */
+    bool IsBatchProcessingEnabledForProvider(EN2CLLMProvider Provider) const
+    {
+        switch (Provider)
+        {
+            case EN2CLLMProvider::Anthropic:
+                return bAnthropicUseBatchProcessing;
+            case EN2CLLMProvider::OpenAI:
+                return bOpenAIUseBatchProcessing;
+            case EN2CLLMProvider::Gemini:
+                return bGeminiUseBatchProcessing;
+            default:
+                return false;
+        }
+    }
+
     /** Enable the global custom instructions for every LLM request. */
     UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "Node to Code | Custom Instructions",
         meta = (DisplayName = "Enable Global Custom Instructions"))
