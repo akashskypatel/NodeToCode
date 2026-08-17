@@ -126,6 +126,13 @@ bool IsNativeBatchAdmissionCapacityFailure(const FString& Reason)
            LowerReason.Contains(TEXT("http 413"));
 }
 
+bool IsNativeBatchAdmissionCapacityResponse(const FString& RawResponse)
+{
+    const FString LowerResponse = RawResponse.ToLower();
+    return LowerResponse.Contains(TEXT("batch_error")) &&
+           IsNativeBatchAdmissionCapacityFailure(LowerResponse);
+}
+
 TArray<TArray<FN2CPendingNativeBatchRequest>> SplitNativeBatchChunk(
     TArray<FN2CPendingNativeBatchRequest> Requests)
 {
@@ -180,6 +187,43 @@ struct FNativeBatchChunkDispatchState
     TArray<TArray<FN2CPendingNativeBatchRequest>> Chunks;
     int32 NextChunkIndex = 0;
 };
+
+bool QueueSmallerNativeBatchChunks(
+    FNativeBatchChunkDispatchState& State,
+    TArray<FN2CPendingNativeBatchRequest>& Requests,
+    const FString& Reason)
+{
+    if (Requests.Num() < 2)
+    {
+        return false;
+    }
+
+    const int32 OriginalRequestCount = Requests.Num();
+    const int64 OriginalEstimatedTokens = EstimateNativeBatchTokens(Requests);
+    TArray<TArray<FN2CPendingNativeBatchRequest>> SmallerChunks =
+        SplitNativeBatchChunk(MoveTemp(Requests));
+    if (SmallerChunks.Num() <= 1)
+    {
+        return false;
+    }
+
+    const int32 InsertIndex = State.NextChunkIndex;
+    const int32 SmallerChunkCount = SmallerChunks.Num();
+    for (int32 Index = SmallerChunks.Num() - 1; Index >= 0; --Index)
+    {
+        State.Chunks.Insert(MoveTemp(SmallerChunks[Index]), InsertIndex);
+    }
+
+    FN2CLogger::Get().LogWarning(
+        FString::Printf(
+            TEXT("Native batch admission rejected for %d requests (~%lld estimated tokens); split into %d smaller chunk(s) and will retry sequentially. Provider response: %s"),
+            OriginalRequestCount,
+            static_cast<long long>(OriginalEstimatedTokens),
+            SmallerChunkCount,
+            *Reason),
+        TEXT("NativeBatch"));
+    return true;
+}
 }
 
 UN2CLLMModule* UN2CLLMModule::Get()
@@ -402,6 +446,7 @@ void UN2CLLMModule::FlushNativeBatchRequests()
 
             TSharedRef<TArray<FN2CPendingNativeBatchRequest>> PendingRef =
                 MakeShared<TArray<FN2CPendingNativeBatchRequest>>(MoveTemp(Chunk));
+            TSharedRef<FString> DeferredAdmissionFailure = MakeShared<FString>();
 
             TArray<FN2CNativeBatchRequest> NativeRequests;
             NativeRequests.Reserve(PendingRef->Num());
@@ -428,10 +473,24 @@ void UN2CLLMModule::FlushNativeBatchRequests()
             TSharedRef<FN2CNativeBatchProcessor> Processor = FN2CNativeBatchProcessor::Create(
                 StrongThis->Config,
                 MoveTemp(NativeRequests),
-                [WeakThis, PendingRef](const FN2CNativeBatchResult& Result)
+                [WeakThis, PendingRef, DeferredAdmissionFailure](const FN2CNativeBatchResult& Result)
                 {
                     UN2CLLMModule* ItemOwner = WeakThis.Get();
                     if (!ItemOwner)
+                    {
+                        return;
+                    }
+
+                    if (N2CLLMModuleSessionPrivate::IsNativeBatchAdmissionCapacityResponse(Result.RawResponse))
+                    {
+                        if (DeferredAdmissionFailure->IsEmpty())
+                        {
+                            *DeferredAdmissionFailure = Result.RawResponse;
+                        }
+                        return;
+                    }
+
+                    if (!DeferredAdmissionFailure->IsEmpty())
                     {
                         return;
                     }
@@ -454,16 +513,38 @@ void UN2CLLMModule::FlushNativeBatchRequests()
                         Result.RawResponse,
                         PendingItem->OnComplete);
                 },
-                [WeakThis, Dispatch]()
+                [WeakThis, PendingRef, DeferredAdmissionFailure, State, Dispatch]() mutable
                 {
-                    if (WeakThis.IsValid())
+                    UN2CLLMModule* BatchOwner = WeakThis.Get();
+                    if (!BatchOwner)
                     {
-                        FN2CLogger::Get().Log(
-                            TEXT("Provider-native batch chunk result collection completed"),
-                            EN2CLogSeverity::Info,
-                            TEXT("NativeBatch"));
-                        (*Dispatch)();
+                        return;
                     }
+
+                    if (!DeferredAdmissionFailure->IsEmpty())
+                    {
+                        if (N2CLLMModuleSessionPrivate::QueueSmallerNativeBatchChunks(
+                                *State,
+                                *PendingRef,
+                                *DeferredAdmissionFailure))
+                        {
+                            (*Dispatch)();
+                            return;
+                        }
+
+                        TArray<FN2CPendingNativeBatchRequest> FallbackRequests = MoveTemp(*PendingRef);
+                        BatchOwner->DispatchPendingBatchIndividually(
+                            MoveTemp(FallbackRequests),
+                            *DeferredAdmissionFailure);
+                        (*Dispatch)();
+                        return;
+                    }
+
+                    FN2CLogger::Get().Log(
+                        TEXT("Provider-native batch chunk result collection completed"),
+                        EN2CLogSeverity::Info,
+                        TEXT("NativeBatch"));
+                    (*Dispatch)();
                 },
                 [WeakThis, PendingRef, State, Dispatch](const FString& Reason) mutable
                 {
@@ -474,34 +555,13 @@ void UN2CLLMModule::FlushNativeBatchRequests()
                     }
 
                     if (N2CLLMModuleSessionPrivate::IsNativeBatchAdmissionCapacityFailure(Reason) &&
-                        PendingRef->Num() >= 2)
+                        N2CLLMModuleSessionPrivate::QueueSmallerNativeBatchChunks(
+                            *State,
+                            *PendingRef,
+                            Reason))
                     {
-                        const int32 OriginalRequestCount = PendingRef->Num();
-                        const int64 OriginalEstimatedTokens =
-                            N2CLLMModuleSessionPrivate::EstimateNativeBatchTokens(*PendingRef);
-                        TArray<TArray<FN2CPendingNativeBatchRequest>> SmallerChunks =
-                            N2CLLMModuleSessionPrivate::SplitNativeBatchChunk(MoveTemp(*PendingRef));
-
-                        if (SmallerChunks.Num() > 1)
-                        {
-                            const int32 InsertIndex = State->NextChunkIndex;
-                            const int32 SmallerChunkCount = SmallerChunks.Num();
-                            for (int32 Index = SmallerChunks.Num() - 1; Index >= 0; --Index)
-                            {
-                                State->Chunks.Insert(MoveTemp(SmallerChunks[Index]), InsertIndex);
-                            }
-
-                            FN2CLogger::Get().LogWarning(
-                                FString::Printf(
-                                    TEXT("Native batch admission rejected for %d requests (~%lld estimated tokens); split into %d smaller chunk(s) and will retry sequentially. Provider response: %s"),
-                                    OriginalRequestCount,
-                                    static_cast<long long>(OriginalEstimatedTokens),
-                                    SmallerChunkCount,
-                                    *Reason),
-                                TEXT("NativeBatch"));
-                            (*Dispatch)();
-                            return;
-                        }
+                        (*Dispatch)();
+                        return;
                     }
 
                     TArray<FN2CPendingNativeBatchRequest> FallbackRequests = MoveTemp(*PendingRef);
