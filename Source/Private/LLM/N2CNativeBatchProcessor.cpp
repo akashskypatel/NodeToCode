@@ -7,6 +7,7 @@
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Misc/DateTime.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -28,7 +29,8 @@ FString SerializeObject(const TSharedPtr<FJsonObject>& Object)
     }
 
     FString Output;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+    TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Output);
     FJsonSerializer::Serialize(Object.ToSharedRef(), Writer);
     return Output;
 }
@@ -399,7 +401,7 @@ void FN2CNativeBatchProcessor::StartOpenAIBatch()
         {
             if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(Status))
             {
-                Self->FallbackBeforeStart(FString::Printf(TEXT("OpenAI batch input upload failed (HTTP %d)"), Status));
+                Self->FallbackBeforeStart(FString::Printf(TEXT("OpenAI batch input upload failed (HTTP %d): %s"), Status, *Body.Left(2000)));
                 return;
             }
 
@@ -426,7 +428,7 @@ void FN2CNativeBatchProcessor::StartOpenAIBatch()
                 {
                     if (!N2CNativeBatchProcessorPrivate::IsSuccessCode(CreateStatus))
                     {
-                        Self->FallbackBeforeStart(FString::Printf(TEXT("OpenAI batch creation failed (HTTP %d)"), CreateStatus));
+                        Self->FallbackBeforeStart(FString::Printf(TEXT("OpenAI batch creation failed (HTTP %d): %s"), CreateStatus, *CreateBody.Left(2000)));
                         return;
                     }
 
@@ -858,8 +860,6 @@ void FN2CNativeBatchProcessor::PollGeminiBatch(const FString& BatchName)
             FString State;
             BatchResource->TryGetStringField(TEXT("state"), State);
 
-            // Some API surfaces may wrap the batch resource in an Operation response. Accept that
-            // representation too, while preferring the documented REST GenerateContentBatch state.
             const TSharedPtr<FJsonObject>* ResponseObject = nullptr;
             if (State.IsEmpty() && BatchResource->TryGetObjectField(TEXT("response"), ResponseObject) &&
                 ResponseObject && ResponseObject->IsValid())
@@ -911,14 +911,12 @@ void FN2CNativeBatchProcessor::ProcessGeminiResults(const TSharedPtr<FJsonObject
 
     const TArray<TSharedPtr<FJsonValue>>* InlineResponses = nullptr;
 
-    // Current REST examples expose dest.inlinedResponses directly as an array.
     const TSharedPtr<FJsonObject>* Dest = nullptr;
     if ((*Resource)->TryGetObjectField(TEXT("dest"), Dest) && Dest && Dest->IsValid())
     {
         (*Dest)->TryGetArrayField(TEXT("inlinedResponses"), InlineResponses);
     }
 
-    // The API resource schema exposes output.inlinedResponses as an InlinedResponses wrapper.
     if (!InlineResponses)
     {
         const TSharedPtr<FJsonObject>* Output = nullptr;

@@ -11,10 +11,11 @@
 namespace N2CHttpRateLimitRetryPrivate
 {
 constexpr int32 MaxRateLimitRetries = 5;
+constexpr int32 MaxConcurrentProviderRequests = 2;
 constexpr float InitialBackoffSeconds = 1.0f;
 constexpr float MaxBackoffSeconds = 60.0f;
 constexpr float MaxServerRetryAfterSeconds = 300.0f;
-constexpr float JitterFraction = 0.20f;
+constexpr float JitterFraction = 0.10f;
 constexpr float MinimumRetryDelaySeconds = 0.10f;
 
 float AddPositiveJitter(float DelaySeconds)
@@ -35,12 +36,36 @@ bool TryParsePositiveSeconds(const FString& Value, float& OutSeconds)
     OutSeconds = ParsedSeconds;
     return true;
 }
+
+bool TryParseRetrySecondsFromProviderMessage(const FString& ResponseBody, float& OutSeconds)
+{
+    const FString Marker = TEXT("Please try again in ");
+    const int32 MarkerIndex = ResponseBody.Find(Marker, ESearchCase::IgnoreCase);
+    if (MarkerIndex == INDEX_NONE)
+    {
+        return false;
+    }
+
+    FString Remaining = ResponseBody.Mid(MarkerIndex + Marker.Len()).TrimStartAndEnd();
+    int32 EndIndex = INDEX_NONE;
+    if (!Remaining.FindChar(TEXT('s'), EndIndex) || EndIndex <= 0)
+    {
+        return false;
+    }
+
+    return TryParsePositiveSeconds(Remaining.Left(EndIndex), OutSeconds);
+}
 }
 
 void UN2CHttpHandlerBase::Initialize(const FN2CLLMConfig& InConfig)
 {
     Config = InConfig;
     RequestTimeout = Config.TimeoutSeconds;
+    PendingRequestQueue.Reset();
+    ActiveRequestCount = 0;
+    ProviderCooldownUntilSeconds = 0.0;
+    bQueuePumpScheduled = false;
+    bRateLimitObserved = false;
 }
 
 void UN2CHttpHandlerBase::PostLLMRequest(
@@ -49,100 +74,122 @@ void UN2CHttpHandlerBase::PostLLMRequest(
     const FString& Payload,
     const FOnLLMResponseReceived& OnComplete)
 {
-    // Validate request parameters
     if (!ValidateRequest(Endpoint, Payload))
     {
         FN2CLogger::Get().LogError(TEXT("Invalid request parameters"), TEXT("HttpHandler"));
-        const bool bExecuted = OnComplete.ExecuteIfBound(TEXT("{\"error\": \"Invalid request parameters\"}"));
+        OnComplete.ExecuteIfBound(TEXT("{\"error\": \"Invalid request parameters\"}"));
         return;
     }
 
-    SendRequestAttempt(Endpoint, AuthToken, Payload, OnComplete, 0);
+    TSharedRef<FN2CQueuedHttpRequest> QueuedRequest = MakeShared<FN2CQueuedHttpRequest>();
+    QueuedRequest->Endpoint = Endpoint;
+    QueuedRequest->AuthToken = AuthToken;
+    QueuedRequest->Payload = Payload;
+    QueuedRequest->OnComplete = OnComplete;
+    PendingRequestQueue.Add(QueuedRequest);
+
+    if (PendingRequestQueue.Num() > 1 || ActiveRequestCount >= N2CHttpRateLimitRetryPrivate::MaxConcurrentProviderRequests)
+    {
+        FN2CLogger::Get().Log(
+            FString::Printf(
+                TEXT("Provider request queued (%d waiting, %d active)"),
+                PendingRequestQueue.Num(),
+                ActiveRequestCount),
+            EN2CLogSeverity::Debug,
+            TEXT("HttpHandler"));
+    }
+
+    PumpRequestQueue();
 }
 
-void UN2CHttpHandlerBase::SendRequestAttempt(
-    const FString& Endpoint,
-    const FString& AuthToken,
-    const FString& Payload,
-    const FOnLLMResponseReceived& OnComplete,
-    int32 RateLimitRetryCount)
+void UN2CHttpHandlerBase::PumpRequestQueue()
 {
-    // Create HTTP request
+    if (PendingRequestQueue.IsEmpty())
+    {
+        return;
+    }
+
+    const double NowSeconds = FPlatformTime::Seconds();
+    if (ProviderCooldownUntilSeconds > NowSeconds)
+    {
+        ScheduleQueuePump(static_cast<float>(ProviderCooldownUntilSeconds - NowSeconds));
+        return;
+    }
+
+    ProviderCooldownUntilSeconds = 0.0;
+    const int32 EffectiveMaxConcurrentRequests = bRateLimitObserved
+        ? 1
+        : N2CHttpRateLimitRetryPrivate::MaxConcurrentProviderRequests;
+
+    while (ActiveRequestCount < EffectiveMaxConcurrentRequests &&
+           !PendingRequestQueue.IsEmpty())
+    {
+        TSharedPtr<FN2CQueuedHttpRequest> QueuedRequest = PendingRequestQueue[0];
+        PendingRequestQueue.RemoveAt(0);
+        if (QueuedRequest.IsValid())
+        {
+            DispatchQueuedRequest(QueuedRequest.ToSharedRef());
+        }
+    }
+}
+
+void UN2CHttpHandlerBase::DispatchQueuedRequest(const TSharedRef<FN2CQueuedHttpRequest>& QueuedRequest)
+{
     TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
-    Request->SetURL(Endpoint);
+    Request->SetURL(QueuedRequest->Endpoint);
     Request->SetVerb(TEXT("POST"));
     Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 
-    // Add authorization if provided
-    if (!AuthToken.IsEmpty())
+    if (!QueuedRequest->AuthToken.IsEmpty())
     {
-        Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *AuthToken));
+        Request->SetHeader(
+            TEXT("Authorization"),
+            FString::Printf(TEXT("Bearer %s"), *QueuedRequest->AuthToken));
     }
 
-    // Add any extra headers
     for (const auto& Header : ExtraHeaders)
     {
         Request->SetHeader(Header.Key, Header.Value);
     }
 
-    Request->SetContentAsString(Payload);
+    Request->SetContentAsString(QueuedRequest->Payload);
     Request->SetTimeout(RequestTimeout);
 
-    // SetActivityTimeout is only available in UE5.4 and later
 #if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 4
     Request->SetActivityTimeout(RequestTimeout);
 #endif
-    
-    // Create a weak pointer to this for safety
-    TWeakObjectPtr<UN2CHttpHandlerBase> WeakThis(this);
 
-    // Create a lambda to handle the completion and perform shared 429 handling before provider parsing.
+    ++ActiveRequestCount;
+    TWeakObjectPtr<UN2CHttpHandlerBase> WeakThis(this);
     Request->OnProcessRequestComplete().BindLambda(
-        [WeakThis,
-         Endpoint,
-         AuthToken,
-         Payload,
-         OnComplete,
-         RateLimitRetryCount](
+        [WeakThis, QueuedRequest](
             FHttpRequestPtr InRequest,
             FHttpResponsePtr InResponse,
             bool bWasSuccessful)
         {
             if (UN2CHttpHandlerBase* StrongThis = WeakThis.Get())
             {
-                if (bWasSuccessful &&
-                    InResponse.IsValid() &&
-                    InResponse->GetResponseCode() == 429 &&
-                    StrongThis->TryScheduleRateLimitRetry(
-                        Endpoint,
-                        AuthToken,
-                        Payload,
-                        OnComplete,
-                        InResponse,
-                        RateLimitRetryCount))
-                {
-                    return;
-                }
-
-                StrongThis->OnRequestComplete(InRequest, InResponse, bWasSuccessful, OnComplete);
+                StrongThis->HandleRequestAttemptComplete(
+                    QueuedRequest,
+                    InRequest,
+                    InResponse,
+                    bWasSuccessful);
             }
             else
             {
-                // Handler was destroyed, just call completion callback with error
-                OnComplete.ExecuteIfBound(TEXT("{\"error\": \"HTTP handler was destroyed\"}"));
+                QueuedRequest->OnComplete.ExecuteIfBound(
+                    TEXT("{\"error\": \"HTTP handler was destroyed\"}"));
             }
-        }
-    );
+        });
 
-    // Send request
     if (!Request->ProcessRequest())
     {
         FN2CLogger::Get().LogError(TEXT("Failed to send HTTP request"), TEXT("HttpHandler"));
-        const bool bExecuted = OnComplete.ExecuteIfBound(TEXT("{\"error\": \"Failed to send request\"}"));
+        HandleRequestAttemptComplete(QueuedRequest, Request, nullptr, false);
         return;
     }
 
-    if (RateLimitRetryCount == 0)
+    if (QueuedRequest->RateLimitRetryCount == 0)
     {
         FN2CLogger::Get().Log(TEXT("HTTP request sent successfully"), EN2CLogSeverity::Info, TEXT("HttpHandler"));
     }
@@ -151,75 +198,104 @@ void UN2CHttpHandlerBase::SendRequestAttempt(
         FN2CLogger::Get().Log(
             FString::Printf(
                 TEXT("HTTP rate-limit retry %d/%d sent successfully"),
-                RateLimitRetryCount,
+                QueuedRequest->RateLimitRetryCount,
                 N2CHttpRateLimitRetryPrivate::MaxRateLimitRetries),
             EN2CLogSeverity::Info,
             TEXT("HttpHandler"));
     }
 }
 
-bool UN2CHttpHandlerBase::TryScheduleRateLimitRetry(
-    const FString& Endpoint,
-    const FString& AuthToken,
-    const FString& Payload,
-    const FOnLLMResponseReceived& OnComplete,
+void UN2CHttpHandlerBase::HandleRequestAttemptComplete(
+    const TSharedRef<FN2CQueuedHttpRequest>& QueuedRequest,
+    FHttpRequestPtr Request,
     FHttpResponsePtr Response,
-    int32 RateLimitRetryCount)
+    bool bWasSuccessful)
 {
-    if (RateLimitRetryCount >= N2CHttpRateLimitRetryPrivate::MaxRateLimitRetries)
+    ActiveRequestCount = FMath::Max(0, ActiveRequestCount - 1);
+
+    const int32 ResponseCode = Response.IsValid() ? Response->GetResponseCode() : 0;
+    const FString ResponseBody = Response.IsValid() ? Response->GetContentAsString() : FString();
+
+    if (Response.IsValid() && ResponseCode == 429)
     {
+        if (IsPermanentRateLimitFailure(ResponseBody))
+        {
+            FN2CLogger::Get().LogError(
+                TEXT("HTTP 429 is non-retryable because this request exceeds the provider's per-request/token limit; reduce the request or output budget"),
+                TEXT("HttpHandler"));
+            OnRequestComplete(Request, Response, bWasSuccessful, QueuedRequest->OnComplete);
+            PumpRequestQueue();
+            return;
+        }
+
+        if (QueuedRequest->RateLimitRetryCount < N2CHttpRateLimitRetryPrivate::MaxRateLimitRetries)
+        {
+            bRateLimitObserved = true;
+            const float RetryDelaySeconds = CalculateRateLimitRetryDelay(
+                Response,
+                ResponseBody,
+                QueuedRequest->RateLimitRetryCount);
+            ++QueuedRequest->RateLimitRetryCount;
+
+            const double RequestedCooldownUntil = FPlatformTime::Seconds() + RetryDelaySeconds;
+            ProviderCooldownUntilSeconds = FMath::Max(
+                ProviderCooldownUntilSeconds,
+                RequestedCooldownUntil);
+
+            // Put the throttled request back at the front. The provider-wide cooldown prevents
+            // this request and all siblings from independently hammering the same token bucket.
+            PendingRequestQueue.Insert(QueuedRequest, 0);
+
+            FN2CLogger::Get().LogWarning(
+                FString::Printf(
+                    TEXT("HTTP 429 rate limit received. Pausing this provider for %.2f seconds; retry %d/%d queued (%d total waiting). Provider concurrency reduced to 1."),
+                    RetryDelaySeconds,
+                    QueuedRequest->RateLimitRetryCount,
+                    N2CHttpRateLimitRetryPrivate::MaxRateLimitRetries,
+                    PendingRequestQueue.Num()),
+                TEXT("HttpHandler"));
+
+            ScheduleQueuePump(RetryDelaySeconds);
+            return;
+        }
+
         FN2CLogger::Get().LogError(
             FString::Printf(
-                TEXT("HTTP 429 rate limit persisted after %d retries; surfacing the provider response"),
+                TEXT("HTTP 429 rate limit persisted after %d coordinated retries; surfacing the provider response"),
                 N2CHttpRateLimitRetryPrivate::MaxRateLimitRetries),
             TEXT("HttpHandler"));
-        return false;
     }
 
-    const float RetryDelaySeconds = CalculateRateLimitRetryDelay(Response, RateLimitRetryCount);
-    const int32 NextRetryCount = RateLimitRetryCount + 1;
+    OnRequestComplete(Request, Response, bWasSuccessful, QueuedRequest->OnComplete);
+    PumpRequestQueue();
+}
 
-    FN2CLogger::Get().LogWarning(
-        FString::Printf(
-            TEXT("HTTP 429 rate limit received. Retrying in %.2f seconds (retry %d/%d)"),
-            RetryDelaySeconds,
-            NextRetryCount,
-            N2CHttpRateLimitRetryPrivate::MaxRateLimitRetries),
-        TEXT("HttpHandler"));
+void UN2CHttpHandlerBase::ScheduleQueuePump(float DelaySeconds)
+{
+    if (bQueuePumpScheduled)
+    {
+        return;
+    }
 
+    bQueuePumpScheduled = true;
     TWeakObjectPtr<UN2CHttpHandlerBase> WeakThis(this);
     FTSTicker::GetCoreTicker().AddTicker(
-        TEXT("NodeToCode.Http429Backoff"),
-        RetryDelaySeconds,
-        [WeakThis,
-         Endpoint,
-         AuthToken,
-         Payload,
-         OnComplete,
-         NextRetryCount](float)
+        TEXT("NodeToCode.ProviderRequestQueue"),
+        FMath::Max(DelaySeconds, N2CHttpRateLimitRetryPrivate::MinimumRetryDelaySeconds),
+        [WeakThis](float)
         {
             if (UN2CHttpHandlerBase* StrongThis = WeakThis.Get())
             {
-                StrongThis->SendRequestAttempt(
-                    Endpoint,
-                    AuthToken,
-                    Payload,
-                    OnComplete,
-                    NextRetryCount);
+                StrongThis->bQueuePumpScheduled = false;
+                StrongThis->PumpRequestQueue();
             }
-            else
-            {
-                OnComplete.ExecuteIfBound(TEXT("{\"error\": \"HTTP handler was destroyed during rate-limit backoff\"}"));
-            }
-
             return false;
         });
-
-    return true;
 }
 
 float UN2CHttpHandlerBase::CalculateRateLimitRetryDelay(
     FHttpResponsePtr Response,
+    const FString& ResponseBody,
     int32 RateLimitRetryCount) const
 {
     using namespace N2CHttpRateLimitRetryPrivate;
@@ -264,11 +340,26 @@ float UN2CHttpHandlerBase::CalculateRateLimitRetryDelay(
         }
     }
 
+    float ProviderMessageSeconds = 0.0f;
+    if (TryParseRetrySecondsFromProviderMessage(ResponseBody, ProviderMessageSeconds))
+    {
+        return AddPositiveJitter(FMath::Clamp(
+            ProviderMessageSeconds,
+            MinimumRetryDelaySeconds,
+            MaxServerRetryAfterSeconds));
+    }
+
     const float ExponentialDelay = FMath::Min(
         InitialBackoffSeconds * FMath::Pow(2.0f, static_cast<float>(RateLimitRetryCount)),
         MaxBackoffSeconds);
 
     return AddPositiveJitter(ExponentialDelay);
+}
+
+bool UN2CHttpHandlerBase::IsPermanentRateLimitFailure(const FString& ResponseBody) const
+{
+    return ResponseBody.Contains(TEXT("Request too large"), ESearchCase::IgnoreCase) ||
+           ResponseBody.Contains(TEXT("must be reduced"), ESearchCase::IgnoreCase);
 }
 
 bool UN2CHttpHandlerBase::ValidateRequest(const FString& Endpoint, const FString& Payload) const
@@ -298,47 +389,40 @@ void UN2CHttpHandlerBase::OnRequestComplete(
     {
         FString ErrorMsg = TEXT("{\"error\": \"Request failed\"}");
         FN2CLogger::Get().LogError(TEXT("HTTP request failed"), TEXT("HttpHandler"));
-        const bool bExecuted = OnComplete.ExecuteIfBound(ErrorMsg);
+        OnComplete.ExecuteIfBound(ErrorMsg);
         OnTranslationResponseReceived.Broadcast(FN2CTranslationResponse(), false);
         return;
     }
 
-    // Check response code
     const int32 ResponseCode = Response->GetResponseCode();
     const FString ResponseContent = Response->GetContentAsString();
 
-    // Handle successful responses (200-299)
     if (ResponseCode >= 200 && ResponseCode < 300)
     {
-        // Return successful response
-        const bool bExecuted = OnComplete.ExecuteIfBound(ResponseContent);
+        OnComplete.ExecuteIfBound(ResponseContent);
         return;
     }
 
-    // For 4xx and 5xx responses
     FString ErrorMsg;
     if (!ResponseContent.IsEmpty() && ResponseContent.StartsWith(TEXT("{")))
     {
-        // Pass through JSON error response
         ErrorMsg = ResponseContent;
     }
     else
     {
-        // Wrap non-JSON error in our format
         ErrorMsg = FString::Printf(
             TEXT("{\"error\": \"HTTP %d - %s\"}"),
             ResponseCode,
-            *ResponseContent
-        );
+            *ResponseContent);
     }
 
     FN2CLogger::Get().LogError(
-        FString::Printf(TEXT("HTTP %d error. Response: %s"), 
+        FString::Printf(
+            TEXT("HTTP %d error. Response: %s"),
             ResponseCode,
             *ResponseContent),
-        TEXT("HttpHandler")
-    );
+        TEXT("HttpHandler"));
 
-    const bool bExecuted = OnComplete.ExecuteIfBound(ErrorMsg);
+    OnComplete.ExecuteIfBound(ErrorMsg);
     OnTranslationResponseReceived.Broadcast(FN2CTranslationResponse(), false);
 }
