@@ -1,6 +1,7 @@
 // Copyright (c) 2025 Nick McClure (Protospatial). All Rights Reserved.
 
 #include "Core/N2CEditorWindow.h"
+#include "Core/N2CTranslationHistoryWindow.h"
 #include "Core/N2CWidgetContainer.h"
 #include "EditorUtilityWidget.h"
 #include "EditorUtilityWidgetBlueprint.h"
@@ -33,8 +34,8 @@ struct FN2CRawResponseViewerState
     TArray<TSharedPtr<FN2CRawResponseViewItem>> Items;
     TSharedPtr<FN2CRawResponseViewItem> SelectedItem;
     TWeakPtr<SListView<TSharedPtr<FN2CRawResponseViewItem>>> ResponseList;
-    int32 ActiveTabIndex = 1; // Response by default.
-    bool bRetryInFlight = false;
+    int32 ActiveTabIndex = 1;
+    TSet<int32> RetryRequestIds;
     FString StatusText;
 };
 
@@ -172,11 +173,9 @@ FReply OpenRawResponseViewer()
                                         *Item->Record.Model,
                                         Item->Record.bParsedSuccessfully ? TEXT("Parsed") : TEXT("Parse failed"));
 
-                                    if (Item->Record.RetriedFromRequestId > 0)
+                                    if (Item->Record.bFinalConsolidation)
                                     {
-                                        Details += FString::Printf(
-                                            TEXT("  |  Retry of #%d"),
-                                            Item->Record.RetriedFromRequestId);
+                                        Details += TEXT("  |  Consolidation");
                                     }
                                     return FText::FromString(Details);
                                 })
@@ -293,12 +292,16 @@ FReply OpenRawResponseViewer()
                 .ToolTipText(NSLOCTEXT(
                     "NodeToCode",
                     "ResendRawRequestToolTip",
-                    "Replay the exact captured request body using the same active provider/model, then parse the new response through the normal Node to Code parser. The original history entry is preserved."))
+                    "Replace this request's response in place. Graph requests replay their captured body; Final Consolidation is rebuilt from the latest successfully parsed graph responses and waits for any in-progress resends first."))
                 .IsEnabled_Lambda([State]()
                 {
-                    return State->SelectedItem.IsValid() &&
-                           !State->SelectedItem->Record.RawRequest.IsEmpty() &&
-                           !State->bRetryInFlight;
+                    if (!State->SelectedItem.IsValid())
+                    {
+                        return false;
+                    }
+                    const FN2CRawResponseRecord& Record = State->SelectedItem->Record;
+                    return (Record.bFinalConsolidation || !Record.RawRequest.IsEmpty()) &&
+                           !State->RetryRequestIds.Contains(Record.RequestId);
                 })
                 .OnClicked_Lambda([State, ViewerWindow]()
                 {
@@ -308,39 +311,35 @@ FReply OpenRawResponseViewer()
                     }
 
                     const int32 RequestId = State->SelectedItem->Record.RequestId;
-                    State->bRetryInFlight = true;
-                    State->StatusText = FString::Printf(
-                        TEXT("Resending request #%d and waiting for a new response..."),
-                        RequestId);
+                    const bool bConsolidation = State->SelectedItem->Record.bFinalConsolidation;
+                    State->RetryRequestIds.Add(RequestId);
+                    State->StatusText = bConsolidation
+                        ? TEXT("Waiting for in-progress requests if necessary, then rebuilding and resending Final Consolidation...")
+                        : FString::Printf(TEXT("Resending request #%d and waiting for a replacement response..."), RequestId);
 
                     const TWeakPtr<SWindow> WeakViewerWindow = ViewerWindow;
                     const bool bStarted = UN2CLLMModule::Get()->ResendRawRequest(
                         RequestId,
-                        [State, WeakViewerWindow](bool bSuccess)
+                        [State, WeakViewerWindow, RequestId](bool bSuccess)
                         {
-                            State->bRetryInFlight = false;
+                            State->RetryRequestIds.Remove(RequestId);
                             State->StatusText = bSuccess
-                                ? TEXT("Retry completed and parsed successfully.")
-                                : TEXT("Retry completed but the new response did not parse successfully.");
+                                ? TEXT("Replacement response completed and parsed successfully.")
+                                : TEXT("Replacement response completed but did not parse successfully.");
 
                             if (!WeakViewerWindow.IsValid())
                             {
                                 return;
                             }
 
-                            const TArray<FN2CRawResponseRecord>& History =
-                                UN2CLLMModule::Get()->GetRawResponseHistory();
-                            const int32 NewRequestId = History.IsEmpty()
-                                ? INDEX_NONE
-                                : History.Last().RequestId;
-                            RefreshN2CRawResponseViewer(State, NewRequestId);
+                            RefreshN2CRawResponseViewer(State, RequestId);
                         });
 
                     if (!bStarted)
                     {
-                        State->bRetryInFlight = false;
+                        State->RetryRequestIds.Remove(RequestId);
                         State->StatusText =
-                            TEXT("Unable to resend this request. The captured body may be unavailable or the active provider/model no longer matches it.");
+                            TEXT("Unable to resend this request. It may already be queued/in progress or the active provider/model no longer matches it.");
                     }
 
                     return FReply::Handled();
@@ -357,8 +356,7 @@ FReply OpenRawResponseViewer()
                     return FReply::Handled();
                 })
             ]
-        ]
-    );
+        ]);
 
     State->ResponseList = ResponseList;
     if (ResponseList.IsValid() && State->SelectedItem.IsValid())
@@ -367,7 +365,6 @@ FReply OpenRawResponseViewer()
     }
 
     FSlateApplication::Get().AddWindow(ViewerWindow.ToSharedRef(), true);
-
     return FReply::Handled();
 }
 }
@@ -395,33 +392,24 @@ void SN2CEditorWindow::UnregisterTabSpawner()
 
 TSharedRef<SDockTab> SN2CEditorWindow::SpawnTab(const FSpawnTabArgs& Args)
 {
-    // Check if we already have an active tab
     if (TSharedPtr<SDockTab> ExistingTab = ActiveTab.Pin())
     {
-        // Bring the existing tab to front
         ExistingTab->DrawAttention();
         return ExistingTab.ToSharedRef();
     }
 
-    // Create new tab
     TSharedRef<SDockTab> SpawnedTab = SNew(SDockTab)
         .TabRole(ETabRole::NomadTab)
-        // Add OnTabClosed handler immediately during construction
         .OnTabClosed_Static(&SN2CEditorWindow::OnTabClosed);
 
-    // Store the active tab reference before creating content
-    // This prevents potential recursive spawning
     ActiveTab = SpawnedTab;
-
     TSharedRef<SN2CEditorWindow> EditorWindow = SNew(SN2CEditorWindow);
     SpawnedTab->SetContent(EditorWindow);
-
     return SpawnedTab;
 }
 
 void SN2CEditorWindow::OnTabClosed(TSharedRef<SDockTab> ClosedTab)
 {
-    // Clear the active tab reference
     if (ActiveTab.Pin() == ClosedTab)
     {
         ActiveTab.Reset();
@@ -430,18 +418,15 @@ void SN2CEditorWindow::OnTabClosed(TSharedRef<SDockTab> ClosedTab)
 
 void SN2CEditorWindow::Construct(const FArguments& InArgs)
 {
-    // 1) Load the widget blueprint
     FString AssetPath = TEXT("/Script/Blutility.EditorUtilityWidgetBlueprint'/NodeToCode/UI/NodeToCodeUI.NodeToCodeUI'");
     UEditorUtilityWidgetBlueprint* EditorBP = LoadObject<UEditorUtilityWidgetBlueprint>(nullptr, *AssetPath);
     if (!EditorBP)
     {
         FN2CLogger::Get().LogError(
-            FString::Printf(TEXT("Failed to load NodeToCodeUI blueprint at path: %s"), 
-            *AssetPath));
+            FString::Printf(TEXT("Failed to load NodeToCodeUI blueprint at path: %s"), *AssetPath));
         return;
     }
 
-    // 2) Manually create the widget (instead of SpawnAndRegisterTab)
     UClass* WidgetClass = EditorBP->GeneratedClass;
     if (!WidgetClass || !WidgetClass->IsChildOf(UEditorUtilityWidget::StaticClass()))
     {
@@ -449,20 +434,15 @@ void SN2CEditorWindow::Construct(const FArguments& InArgs)
         return;
     }
 
-    // Use our persistent container as the outer
     UEditorUtilityWidget* EditorWidget = NewObject<UEditorUtilityWidget>(
         UN2CWidgetContainer::Get(),
-        WidgetClass
-    );
+        WidgetClass);
     if (!EditorWidget)
     {
         FN2CLogger::Get().LogError(TEXT("Failed to create Editor Utility Widget instance"));
         return;
     }
 
-    // 3) Add a lightweight native session toolbar above the existing Editor Utility Widget.
-    // This keeps the binary UI assets untouched while exposing reliable progress/raw-response
-    // state shared by both single-graph and full-Blueprint translation paths.
     ChildSlot
     [
         SNew(SVerticalBox)
@@ -517,6 +497,23 @@ void SN2CEditorWindow::Construct(const FArguments& InArgs)
                 + SHorizontalBox::Slot()
                 .AutoWidth()
                 .VAlign(VAlign_Center)
+                .Padding(0.0f, 0.0f, 6.0f, 0.0f)
+                [
+                    SNew(SButton)
+                    .Text(NSLOCTEXT("NodeToCode", "ViewPreviousTranslations", "View Previous Translations"))
+                    .ToolTipText(NSLOCTEXT(
+                        "NodeToCode",
+                        "ViewPreviousTranslationsToolTip",
+                        "Browse saved Node to Code translation batches and inspect their persisted request/response history."))
+                    .OnClicked_Lambda([]()
+                    {
+                        FN2CTranslationHistoryWindow::Open();
+                        return FReply::Handled();
+                    })
+                ]
+                + SHorizontalBox::Slot()
+                .AutoWidth()
+                .VAlign(VAlign_Center)
                 [
                     SNew(SButton)
                     .Text_Lambda([]()
@@ -528,7 +525,7 @@ void SN2CEditorWindow::Construct(const FArguments& InArgs)
                     .ToolTipText(NSLOCTEXT(
                         "NodeToCode",
                         "RawResponsesToolTip",
-                        "View the exact request body and formatted provider response for any request in the current translation session, and optionally replay it."))
+                        "View the request body and formatted provider response for any request in the current translation session, and optionally replace/re-parse it."))
                     .IsEnabled_Lambda([]()
                     {
                         return UN2CLLMModule::Get()->GetRawResponseCount() > 0;

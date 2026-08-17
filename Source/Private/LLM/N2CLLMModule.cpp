@@ -2,25 +2,63 @@
 
 #include "LLM/N2CLLMModule.h"
 
+#include "Containers/Ticker.h"
 #include "Core/N2CNodeTranslator.h"
 #include "Core/N2CSerializer.h"
 #include "Core/N2CSettings.h"
-#include "LLM/N2CBatchTranslationConsolidator.h"
-#include "LLM/N2CSystemPromptManager.h"
+#include "Core/N2CTranslationHistory.h"
+#include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformProcess.h"
 #include "LLM/N2CBaseLLMService.h"
+#include "LLM/N2CBatchTranslationConsolidator.h"
 #include "LLM/N2CLLMProviderRegistry.h"
+#include "LLM/N2CNativeBatchProcessor.h"
+#include "LLM/N2CSystemPromptManager.h"
 #include "LLM/Providers/N2CAnthropicService.h"
 #include "LLM/Providers/N2CDeepSeekService.h"
 #include "LLM/Providers/N2CGeminiService.h"
 #include "LLM/Providers/N2CLMStudioService.h"
-#include "LLM/Providers/N2COpenAIService.h"
-#include "LLM/Providers/N2COllamaService.h"
 #include "LLM/Providers/N2CMiniMaxService.h"
+#include "LLM/Providers/N2COllamaService.h"
+#include "LLM/Providers/N2COpenAIService.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "Policies/PrettyJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "Utils/N2CLogger.h"
+
+namespace N2CLLMModuleSessionPrivate
+{
+void MergeTranslationResponse(
+    FN2CTranslationResponse& Target,
+    const FN2CTranslationResponse& Source)
+{
+    for (const FN2CGraphTranslation& Graph : Source.Graphs)
+    {
+        const int32 ExistingIndex = Target.Graphs.IndexOfByPredicate(
+            [&Graph](const FN2CGraphTranslation& Existing)
+            {
+                return Existing.GraphName.Equals(Graph.GraphName, ESearchCase::CaseSensitive) &&
+                       Existing.GraphType.Equals(Graph.GraphType, ESearchCase::CaseSensitive) &&
+                       Existing.GraphClass.Equals(Graph.GraphClass, ESearchCase::CaseSensitive);
+            });
+
+        if (ExistingIndex == INDEX_NONE)
+        {
+            Target.Graphs.Add(Graph);
+        }
+        else
+        {
+            Target.Graphs[ExistingIndex] = Graph;
+        }
+    }
+
+    Target.Usage.InputTokens += Source.Usage.InputTokens;
+    Target.Usage.OutputTokens += Source.Usage.OutputTokens;
+}
+}
 
 UN2CLLMModule* UN2CLLMModule::Get()
 {
@@ -28,7 +66,7 @@ UN2CLLMModule* UN2CLLMModule::Get()
     if (!Instance)
     {
         Instance = NewObject<UN2CLLMModule>();
-        Instance->AddToRoot(); // Prevent garbage collection
+        Instance->AddToRoot();
         Instance->CurrentStatus = EN2CSystemStatus::Idle;
         Instance->LatestTranslationPath = TEXT("");
     }
@@ -41,8 +79,7 @@ bool UN2CLLMModule::Initialize()
     bIsInitialized = false;
     ResetRequestSession();
     CurrentStatus = EN2CSystemStatus::Initializing;
-    
-    // Load settings
+
     const UN2CSettings* Settings = GetDefault<UN2CSettings>();
     if (!Settings)
     {
@@ -51,15 +88,12 @@ bool UN2CLLMModule::Initialize()
         return false;
     }
 
-    // Create config from settings
     Config.Provider = Settings->Provider;
     Config.ApiKey = Settings->GetActiveApiKey();
     Config.Model = Settings->GetActiveModel();
 
-    // Initialize provider registry
     InitializeProviderRegistry();
 
-    // Initialize components
     if (!InitializeComponents() || !CreateServiceForProvider(Config.Provider))
     {
         CurrentStatus = EN2CSystemStatus::Error;
@@ -77,48 +111,324 @@ void UN2CLLMModule::ResetRequestSession()
     InFlightRequestCount = 0;
     NextRequestId = 1;
     bSessionHadError = false;
+
     SessionRawResponses.Reset();
+    ParsedGraphResponsesByRequestId.Reset();
+    PendingNativeBatchRequests.Reset();
+    RetryInFlightRequestIds.Reset();
+
     SessionTranslationResponse.Graphs.Reset();
     SessionTranslationResponse.Usage.InputTokens = 0;
     SessionTranslationResponse.Usage.OutputTokens = 0;
 
-    // A new Initialize() starts a new user operation. Clear any stale batch path left by an
-    // interrupted/failed prior batch, while intentionally retaining LatestTranslationPath so the
-    // Open Folder action can still reach the last completed output.
+    bNativeBatchFlushScheduled = false;
+    PendingConsolidationRetryRequestId = INDEX_NONE;
+    PendingConsolidationRetryCompletion = TFunction<void(bool)>();
+
     CurrentBatchRootPath.Empty();
     CurrentStatus = EN2CSystemStatus::Idle;
 }
 
 void UN2CLLMModule::AppendSessionResponse(const FN2CTranslationResponse& Response)
 {
-    for (const FN2CGraphTranslation& Graph : Response.Graphs)
-    {
-        const int32 ExistingIndex = SessionTranslationResponse.Graphs.IndexOfByPredicate(
-            [&Graph](const FN2CGraphTranslation& Existing)
-            {
-                return Existing.GraphName.Equals(Graph.GraphName, ESearchCase::CaseSensitive) &&
-                       Existing.GraphType.Equals(Graph.GraphType, ESearchCase::CaseSensitive) &&
-                       Existing.GraphClass.Equals(Graph.GraphClass, ESearchCase::CaseSensitive);
-            });
+    N2CLLMModuleSessionPrivate::MergeTranslationResponse(SessionTranslationResponse, Response);
+}
 
-        if (ExistingIndex == INDEX_NONE)
+FN2CTranslationResponse UN2CLLMModule::BuildGraphAggregateResponse() const
+{
+    FN2CTranslationResponse Aggregate;
+    Aggregate.Usage.InputTokens = 0;
+    Aggregate.Usage.OutputTokens = 0;
+
+    TArray<int32> RequestIds;
+    ParsedGraphResponsesByRequestId.GetKeys(RequestIds);
+    RequestIds.Sort();
+
+    for (const int32 RequestId : RequestIds)
+    {
+        if (const FN2CTranslationResponse* Response = ParsedGraphResponsesByRequestId.Find(RequestId))
         {
-            SessionTranslationResponse.Graphs.Add(Graph);
-        }
-        else
-        {
-            SessionTranslationResponse.Graphs[ExistingIndex] = Graph;
+            N2CLLMModuleSessionPrivate::MergeTranslationResponse(Aggregate, *Response);
         }
     }
 
-    SessionTranslationResponse.Usage.InputTokens += Response.Usage.InputTokens;
-    SessionTranslationResponse.Usage.OutputTokens += Response.Usage.OutputTokens;
+    return Aggregate;
+}
+
+void UN2CLLMModule::RebuildSessionResponseFromGraphRequests()
+{
+    SessionTranslationResponse = BuildGraphAggregateResponse();
+}
+
+bool UN2CLLMModule::TryQueueNativeBatchRequest(
+    const FString& JsonInput,
+    const FString& SystemPrompt,
+    const FOnLLMResponseReceived& OnComplete)
+{
+    if (CurrentBatchRootPath.IsEmpty() ||
+        !FN2CNativeBatchProcessor::SupportsProvider(Config.Provider))
+    {
+        return false;
+    }
+
+    UN2CBaseLLMService* BaseService = Cast<UN2CBaseLLMService>(ActiveService.GetObject());
+    if (!BaseService || !BaseService->IsInitialized())
+    {
+        return false;
+    }
+
+    const FString FormattedPayload = BaseService->BuildFormattedRequestPayload(JsonInput, SystemPrompt);
+    if (FormattedPayload.IsEmpty())
+    {
+        return false;
+    }
+
+    FN2CPendingNativeBatchRequest Pending;
+    Pending.RequestId = NextRequestId++;
+    Pending.RequestLabel = FString::Printf(TEXT("Request %d"), Pending.RequestId);
+    Pending.FormattedPayload = FormattedPayload;
+    Pending.OnComplete = OnComplete;
+    PendingNativeBatchRequests.Add(MoveTemp(Pending));
+
+    ++InFlightRequestCount;
+    CurrentStatus = EN2CSystemStatus::Processing;
+    OnTranslationRequestSent.Broadcast();
+
+    if (!bNativeBatchFlushScheduled)
+    {
+        bNativeBatchFlushScheduled = true;
+        TWeakObjectPtr<UN2CLLMModule> WeakThis(this);
+        FTSTicker::GetCoreTicker().AddTicker(
+            TEXT("NodeToCode.NativeBatchFlush"),
+            0.0f,
+            [WeakThis](float)
+            {
+                if (UN2CLLMModule* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->FlushNativeBatchRequests();
+                }
+                return false;
+            });
+    }
+
+    return true;
+}
+
+void UN2CLLMModule::FlushNativeBatchRequests()
+{
+    bNativeBatchFlushScheduled = false;
+
+    TArray<FN2CPendingNativeBatchRequest> Pending = MoveTemp(PendingNativeBatchRequests);
+    PendingNativeBatchRequests.Reset();
+
+    if (Pending.IsEmpty())
+    {
+        return;
+    }
+
+    if (Pending.Num() < 2 || !FN2CNativeBatchProcessor::SupportsProvider(Config.Provider))
+    {
+        DispatchPendingBatchIndividually(MoveTemp(Pending), TEXT("Not enough requests for provider-native batching"));
+        return;
+    }
+
+    TSharedRef<TArray<FN2CPendingNativeBatchRequest>> PendingRef =
+        MakeShared<TArray<FN2CPendingNativeBatchRequest>>(MoveTemp(Pending));
+
+    TArray<FN2CNativeBatchRequest> NativeRequests;
+    NativeRequests.Reserve(PendingRef->Num());
+    for (const FN2CPendingNativeBatchRequest& Item : *PendingRef)
+    {
+        FN2CNativeBatchRequest Native;
+        Native.RequestId = Item.RequestId;
+        Native.RequestLabel = Item.RequestLabel;
+        Native.FormattedPayload = Item.FormattedPayload;
+        NativeRequests.Add(MoveTemp(Native));
+    }
+
+    TWeakObjectPtr<UN2CLLMModule> WeakThis(this);
+    TSharedRef<FN2CNativeBatchProcessor> Processor = FN2CNativeBatchProcessor::Create(
+        Config,
+        MoveTemp(NativeRequests),
+        [WeakThis, PendingRef](const FN2CNativeBatchResult& Result)
+        {
+            UN2CLLMModule* StrongThis = WeakThis.Get();
+            if (!StrongThis)
+            {
+                return;
+            }
+
+            const FN2CPendingNativeBatchRequest* PendingItem = PendingRef->FindByPredicate(
+                [&Result](const FN2CPendingNativeBatchRequest& Candidate)
+                {
+                    return Candidate.RequestId == Result.RequestId;
+                });
+
+            if (!PendingItem)
+            {
+                return;
+            }
+
+            StrongThis->HandleCompletedBatchItem(
+                Result.RequestId,
+                Result.RequestLabel,
+                Result.FormattedPayload,
+                Result.RawResponse,
+                PendingItem->OnComplete);
+        },
+        []()
+        {
+            FN2CLogger::Get().Log(
+                TEXT("Provider-native batch result collection completed"),
+                EN2CLogSeverity::Info,
+                TEXT("NativeBatch"));
+        },
+        [WeakThis, PendingRef](const FString& Reason)
+        {
+            if (UN2CLLMModule* StrongThis = WeakThis.Get())
+            {
+                TArray<FN2CPendingNativeBatchRequest> FallbackRequests = MoveTemp(*PendingRef);
+                StrongThis->DispatchPendingBatchIndividually(MoveTemp(FallbackRequests), Reason);
+            }
+        });
+
+    Processor->Start();
+}
+
+void UN2CLLMModule::DispatchPendingBatchIndividually(
+    TArray<FN2CPendingNativeBatchRequest> Requests,
+    const FString& Reason)
+{
+    FN2CLogger::Get().LogWarning(
+        FString::Printf(TEXT("Using ordinary parallel requests instead of native batch: %s"), *Reason),
+        TEXT("NativeBatch"));
+
+    UN2CBaseLLMService* BaseService = Cast<UN2CBaseLLMService>(ActiveService.GetObject());
+    if (!BaseService || !BaseService->IsInitialized())
+    {
+        const FString ErrorResponse = TEXT("{\"error\":{\"type\":\"batch_fallback_error\",\"message\":\"Active provider service is unavailable\"}}");
+        for (const FN2CPendingNativeBatchRequest& Item : Requests)
+        {
+            HandleCompletedBatchItem(
+                Item.RequestId,
+                Item.RequestLabel,
+                Item.FormattedPayload,
+                ErrorResponse,
+                Item.OnComplete);
+        }
+        return;
+    }
+
+    for (const FN2CPendingNativeBatchRequest& Item : Requests)
+    {
+        BaseService->ResendFormattedRequest(
+            Item.FormattedPayload,
+            FOnLLMResponseReceived::CreateLambda(
+                [this, Item](const FString& Response)
+                {
+                    HandleCompletedBatchItem(
+                        Item.RequestId,
+                        Item.RequestLabel,
+                        Item.FormattedPayload,
+                        Response,
+                        Item.OnComplete);
+                }));
+    }
+}
+
+void UN2CLLMModule::HandleCompletedBatchItem(
+    int32 RequestId,
+    const FString& RequestLabel,
+    const FString& RawRequest,
+    const FString& Response,
+    const FOnLLMResponseReceived& OnComplete)
+{
+    FN2CTranslationResponse TranslationResponse;
+    TranslationResponse.Usage.InputTokens = 0;
+    TranslationResponse.Usage.OutputTokens = 0;
+
+    bool bParsedSuccessfully = false;
+    FString ResolvedLabel = RequestLabel;
+
+    TScriptInterface<IN2CLLMService> Service = GetActiveService();
+    UN2CResponseParserBase* Parser = Service.GetInterface() ? Service->GetResponseParser() : nullptr;
+    if (Parser && Parser->ParseLLMResponse(Response, TranslationResponse))
+    {
+        bParsedSuccessfully = true;
+        if (!TranslationResponse.Graphs.IsEmpty() && !TranslationResponse.Graphs[0].GraphName.IsEmpty())
+        {
+            ResolvedLabel = TranslationResponse.Graphs[0].GraphName;
+        }
+
+        ParsedGraphResponsesByRequestId.Add(RequestId, TranslationResponse);
+        RebuildSessionResponseFromGraphRequests();
+
+        const FN2CBlueprint& Blueprint = FN2CNodeTranslator::Get().GetN2CBlueprint();
+        if (SaveTranslationToDisk(TranslationResponse, Blueprint))
+        {
+            FN2CLogger::Get().Log(TEXT("Successfully saved translation to disk"), EN2CLogSeverity::Info);
+        }
+
+        OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, true);
+        FN2CLogger::Get().Log(
+            FString::Printf(TEXT("Successfully parsed native-batch response for: %s"), *ResolvedLabel),
+            EN2CLogSeverity::Info,
+            TEXT("NativeBatch"));
+    }
+    else
+    {
+        ParsedGraphResponsesByRequestId.Remove(RequestId);
+        RebuildSessionResponseFromGraphRequests();
+        SaveRawResponseToDisk(Response);
+        OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
+        FN2CLogger::Get().LogError(
+            FString::Printf(TEXT("Failed to parse native-batch response for: %s"), *ResolvedLabel),
+            TEXT("NativeBatch"));
+    }
+
+    FN2CRawResponseRecord Record;
+    Record.RequestId = RequestId;
+    Record.RequestLabel = ResolvedLabel;
+    Record.Provider = Config.Provider;
+    Record.Model = Config.Model;
+    Record.Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"));
+    Record.RawRequest = RawRequest;
+    Record.FormattedResponse = FormatRawResponseForDisplay(Response);
+    Record.bParsedSuccessfully = bParsedSuccessfully;
+
+    const int32 ExistingIndex = SessionRawResponses.IndexOfByPredicate(
+        [RequestId](const FN2CRawResponseRecord& Existing)
+        {
+            return Existing.RequestId == RequestId;
+        });
+    if (ExistingIndex == INDEX_NONE)
+    {
+        SessionRawResponses.Add(MoveTemp(Record));
+    }
+    else
+    {
+        SessionRawResponses[ExistingIndex] = MoveTemp(Record);
+    }
+
+    PersistRequestHistory();
+
+    // Preserve existing callback ordering: the whole-Blueprint caller can start consolidation
+    // after its last logical graph result while this logical request still counts as in flight.
+    OnComplete.ExecuteIfBound(Response);
+    FinishRequest(bParsedSuccessfully);
 }
 
 void UN2CLLMModule::FinishRequest(bool bSuccess)
 {
-    bSessionHadError |= !bSuccess;
     InFlightRequestCount = FMath::Max(0, InFlightRequestCount - 1);
+
+    // Error state follows the current replaceable history rather than being permanently sticky.
+    // A successful resend can therefore recover a previously failed request.
+    bSessionHadError = SessionRawResponses.ContainsByPredicate(
+        [](const FN2CRawResponseRecord& Record)
+        {
+            return !Record.bParsedSuccessfully;
+        });
 
     if (InFlightRequestCount > 0)
     {
@@ -128,6 +438,28 @@ void UN2CLLMModule::FinishRequest(bool bSuccess)
     {
         CurrentStatus = bSessionHadError ? EN2CSystemStatus::Error : EN2CSystemStatus::Idle;
     }
+
+    StartQueuedConsolidationIfReady();
+}
+
+void UN2CLLMModule::StartQueuedConsolidationIfReady()
+{
+    if (InFlightRequestCount != 0 || PendingConsolidationRetryRequestId == INDEX_NONE)
+    {
+        return;
+    }
+
+    const int32 RequestId = PendingConsolidationRetryRequestId;
+    PendingConsolidationRetryRequestId = INDEX_NONE;
+    TFunction<void(bool)> Completion = MoveTemp(PendingConsolidationRetryCompletion);
+    PendingConsolidationRetryCompletion = TFunction<void(bool)>();
+
+    FN2CLogger::Get().Log(
+        TEXT("All in-progress requests completed; starting queued final consolidation with refreshed graph responses"),
+        EN2CLogSeverity::Info,
+        TEXT("BatchConsolidation"));
+
+    StartFinalConsolidation(RequestId, MoveTemp(Completion));
 }
 
 FString UN2CLLMModule::FormatRawResponseForDisplay(const FString& RawResponse) const
@@ -163,7 +495,8 @@ void UN2CLLMModule::ProcessN2CJson(
         return;
     }
 
-    if (!ActiveService.GetInterface())
+    TScriptInterface<IN2CLLMService> Service = GetActiveService();
+    if (!Service.GetInterface())
     {
         CurrentStatus = EN2CSystemStatus::Error;
         FN2CLogger::Get().LogError(TEXT("No active LLM service"), TEXT("LLMModule"));
@@ -171,123 +504,86 @@ void UN2CLLMModule::ProcessN2CJson(
         return;
     }
 
-    // Get active service
-    TScriptInterface<IN2CLLMService> Service = GetActiveService();
-    if (!Service.GetInterface())
-    {
-        CurrentStatus = EN2CSystemStatus::Error;
-        FN2CLogger::Get().LogError(TEXT("No active service"), TEXT("LLMModule"));
-        OnComplete.ExecuteIfBound(TEXT("{\"error\": \"No active service\"}"));
-        return;
-    }
-
-    // Check if service supports system prompts
-    bool bSupportsSystemPrompts = false;
-    FString Endpoint, AuthToken;
-    Service->GetConfiguration(Endpoint, AuthToken, bSupportsSystemPrompts);
-
-    // Get system prompt with language specification
     const UN2CSettings* Settings = GetDefault<UN2CSettings>();
-    FString SystemPrompt = PromptManager->GetLanguageSpecificPrompt(
+    const FString SystemPrompt = PromptManager->GetLanguageSpecificPrompt(
         TEXT("CodeGen"),
-        Settings ? Settings->TargetLanguage : EN2CCodeLanguage::Cpp
-    );
+        Settings ? Settings->TargetLanguage : EN2CCodeLanguage::Cpp);
 
-    // Connect the HTTP handler's translation response delegate to our module's delegate
-    if (HttpHandler)
+    if (TryQueueNativeBatchRequest(JsonInput, SystemPrompt, OnComplete))
     {
-        HttpHandler->OnTranslationResponseReceived = OnTranslationResponseReceived;
+        return;
     }
 
     const int32 RequestId = NextRequestId++;
     const EN2CLLMProvider RequestProvider = Config.Provider;
     const FString RequestModel = Config.Model;
     const TSharedRef<FString> CapturedRawRequest = MakeShared<FString>();
+
     ++InFlightRequestCount;
     CurrentStatus = EN2CSystemStatus::Processing;
-
-    // Broadcast that request is being sent
     OnTranslationRequestSent.Broadcast();
 
-    // Send request through service
-    ActiveService->SendRequest(JsonInput, SystemPrompt, FOnLLMResponseReceived::CreateLambda(
-        [this, OnComplete, RequestId, RequestProvider, RequestModel, CapturedRawRequest](const FString& Response)
-        {
-            FN2CTranslationResponse TranslationResponse;
-            TranslationResponse.Usage.InputTokens = 0;
-            TranslationResponse.Usage.OutputTokens = 0;
-            bool bParsedSuccessfully = false;
-            FString RequestLabel = FString::Printf(TEXT("Request %d"), RequestId);
-            
-            // Get active service's response parser
-            TScriptInterface<IN2CLLMService> ActiveServiceParser = GetActiveService();
-            if (ActiveServiceParser.GetInterface())
+    ActiveService->SendRequest(
+        JsonInput,
+        SystemPrompt,
+        FOnLLMResponseReceived::CreateLambda(
+            [this, OnComplete, RequestId, RequestProvider, RequestModel, CapturedRawRequest](const FString& Response)
             {
-                UN2CResponseParserBase* Parser = ActiveServiceParser->GetResponseParser();
-                if (Parser)
-                {
-                    if (Parser->ParseLLMResponse(Response, TranslationResponse))
-                    {
-                        bParsedSuccessfully = true;
-                        if (!TranslationResponse.Graphs.IsEmpty() &&
-                            !TranslationResponse.Graphs[0].GraphName.IsEmpty())
-                        {
-                            RequestLabel = TranslationResponse.Graphs[0].GraphName;
-                        }
+                FN2CTranslationResponse TranslationResponse;
+                TranslationResponse.Usage.InputTokens = 0;
+                TranslationResponse.Usage.OutputTokens = 0;
+                bool bParsedSuccessfully = false;
+                FString RequestLabel = FString::Printf(TEXT("Request %d"), RequestId);
 
-                        // Merge before saving/broadcasting so a batch manifest and the existing UI
-                        // always see every successful result accumulated in this translation session.
-                        AppendSessionResponse(TranslationResponse);
-                            
-                        // Save translation to disk
-                        const FN2CBlueprint& Blueprint = FN2CNodeTranslator::Get().GetN2CBlueprint();
-                        if (SaveTranslationToDisk(TranslationResponse, Blueprint))
-                        {
-                            FN2CLogger::Get().Log(TEXT("Successfully saved translation to disk"), EN2CLogSeverity::Info);
-                        }
-                            
-                        OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, true);
-                        FN2CLogger::Get().Log(TEXT("Successfully parsed LLM response"), EN2CLogSeverity::Info);
-                    }
-                    else
+                TScriptInterface<IN2CLLMService> ParserService = GetActiveService();
+                UN2CResponseParserBase* Parser = ParserService.GetInterface()
+                    ? ParserService->GetResponseParser()
+                    : nullptr;
+
+                if (Parser && Parser->ParseLLMResponse(Response, TranslationResponse))
+                {
+                    bParsedSuccessfully = true;
+                    if (!TranslationResponse.Graphs.IsEmpty() && !TranslationResponse.Graphs[0].GraphName.IsEmpty())
                     {
-                        FN2CLogger::Get().LogError(TEXT("Failed to parse LLM response"));
-                        SaveRawResponseToDisk(Response);
-                        OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
+                        RequestLabel = TranslationResponse.Graphs[0].GraphName;
                     }
+
+                    ParsedGraphResponsesByRequestId.Add(RequestId, TranslationResponse);
+                    RebuildSessionResponseFromGraphRequests();
+
+                    const FN2CBlueprint& Blueprint = FN2CNodeTranslator::Get().GetN2CBlueprint();
+                    if (SaveTranslationToDisk(TranslationResponse, Blueprint))
+                    {
+                        FN2CLogger::Get().Log(TEXT("Successfully saved translation to disk"), EN2CLogSeverity::Info);
+                    }
+
+                    OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, true);
+                    FN2CLogger::Get().Log(TEXT("Successfully parsed LLM response"), EN2CLogSeverity::Info);
                 }
                 else
                 {
-                    FN2CLogger::Get().LogError(TEXT("No response parser available"));
+                    ParsedGraphResponsesByRequestId.Remove(RequestId);
+                    RebuildSessionResponseFromGraphRequests();
+                    FN2CLogger::Get().LogError(TEXT("Failed to parse LLM response"));
+                    SaveRawResponseToDisk(Response);
                     OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
                 }
-            }
-            else
-            {
-                FN2CLogger::Get().LogError(TEXT("No active LLM service"));
-                OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
-            }
 
-            FN2CRawResponseRecord RawRecord;
-            RawRecord.RequestId = RequestId;
-            RawRecord.RequestLabel = RequestLabel;
-            RawRecord.Provider = RequestProvider;
-            RawRecord.Model = RequestModel;
-            RawRecord.Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"));
-            RawRecord.RawRequest = *CapturedRawRequest;
-            RawRecord.FormattedResponse = FormatRawResponseForDisplay(Response);
-            RawRecord.bParsedSuccessfully = bParsedSuccessfully;
-            SessionRawResponses.Add(MoveTemp(RawRecord));
+                FN2CRawResponseRecord RawRecord;
+                RawRecord.RequestId = RequestId;
+                RawRecord.RequestLabel = RequestLabel;
+                RawRecord.Provider = RequestProvider;
+                RawRecord.Model = RequestModel;
+                RawRecord.Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"));
+                RawRecord.RawRequest = *CapturedRawRequest;
+                RawRecord.FormattedResponse = FormatRawResponseForDisplay(Response);
+                RawRecord.bParsedSuccessfully = bParsedSuccessfully;
+                SessionRawResponses.Add(MoveTemp(RawRecord));
+                PersistRequestHistory();
 
-            // The caller's completion delegate is part of the request lifecycle. This was
-            // previously omitted for normal HTTP completions, which prevented Translate Entire
-            // Blueprint's remaining-response counter from ever reaching zero.
-            OnComplete.ExecuteIfBound(Response);
-
-            // Keep Processing active until both the HTTP response and all caller completion work
-            // for this request have finished.
-            FinishRequest(bParsedSuccessfully);
-        }));
+                OnComplete.ExecuteIfBound(Response);
+                FinishRequest(bParsedSuccessfully);
+            }));
 
     if (UN2CBaseLLMService* BaseService = Cast<UN2CBaseLLMService>(ActiveService.GetObject()))
     {
@@ -299,13 +595,13 @@ bool UN2CLLMModule::ResendRawRequest(
     int32 RequestId,
     TFunction<void(bool)> OnComplete)
 {
-    const FN2CRawResponseRecord* ExistingRecord = SessionRawResponses.FindByPredicate(
+    const int32 ExistingIndex = SessionRawResponses.IndexOfByPredicate(
         [RequestId](const FN2CRawResponseRecord& Record)
         {
             return Record.RequestId == RequestId;
         });
 
-    if (!ExistingRecord)
+    if (ExistingIndex == INDEX_NONE)
     {
         FN2CLogger::Get().LogError(
             FString::Printf(TEXT("Cannot resend unknown raw request #%d"), RequestId),
@@ -313,11 +609,58 @@ bool UN2CLLMModule::ResendRawRequest(
         return false;
     }
 
-    const FN2CRawResponseRecord OriginalRecord = *ExistingRecord;
+    if (RetryInFlightRequestIds.Contains(RequestId) ||
+        PendingConsolidationRetryRequestId == RequestId)
+    {
+        FN2CLogger::Get().LogWarning(
+            FString::Printf(TEXT("Request #%d is already being resent or queued"), RequestId),
+            TEXT("RawRequestRetry"));
+        return false;
+    }
+
+    const FN2CRawResponseRecord OriginalRecord = SessionRawResponses[ExistingIndex];
+
+    if (OriginalRecord.Provider != Config.Provider ||
+        !OriginalRecord.Model.Equals(Config.Model, ESearchCase::CaseSensitive))
+    {
+        FN2CLogger::Get().LogError(
+            FString::Printf(
+                TEXT("Cannot resend request #%d because the active provider/model no longer matches it"),
+                RequestId),
+            TEXT("RawRequestRetry"));
+        return false;
+    }
+
+    if (OriginalRecord.bFinalConsolidation)
+    {
+        if (InFlightRequestCount > 0)
+        {
+            if (PendingConsolidationRetryRequestId != INDEX_NONE)
+            {
+                FN2CLogger::Get().LogWarning(
+                    TEXT("A final consolidation retry is already queued"),
+                    TEXT("BatchConsolidation"));
+                return false;
+            }
+
+            PendingConsolidationRetryRequestId = RequestId;
+            PendingConsolidationRetryCompletion = MoveTemp(OnComplete);
+            FN2CLogger::Get().Log(
+                FString::Printf(
+                    TEXT("Queued final consolidation resend until %d in-progress request(s) complete"),
+                    InFlightRequestCount),
+                EN2CLogSeverity::Info,
+                TEXT("BatchConsolidation"));
+            return true;
+        }
+
+        return StartFinalConsolidation(RequestId, MoveTemp(OnComplete));
+    }
+
     if (OriginalRecord.RawRequest.IsEmpty())
     {
         FN2CLogger::Get().LogError(
-            FString::Printf(TEXT("Cannot resend request #%d because its raw request body was not captured"), RequestId),
+            FString::Printf(TEXT("Cannot resend request #%d because its captured request body is empty"), RequestId),
             TEXT("RawRequestRetry"));
         return false;
     }
@@ -331,27 +674,14 @@ bool UN2CLLMModule::ResendRawRequest(
         return false;
     }
 
-    if (OriginalRecord.Provider != Config.Provider ||
-        !OriginalRecord.Model.Equals(Config.Model, ESearchCase::CaseSensitive))
-    {
-        FN2CLogger::Get().LogError(
-            FString::Printf(
-                TEXT("Cannot replay request #%d because the active provider/model no longer matches the captured request"),
-                RequestId),
-            TEXT("RawRequestRetry"));
-        return false;
-    }
-
-    const int32 RetryRequestId = NextRequestId++;
+    RetryInFlightRequestIds.Add(RequestId);
     ++InFlightRequestCount;
     CurrentStatus = EN2CSystemStatus::Processing;
     OnTranslationRequestSent.Broadcast();
 
     FN2CLogger::Get().Log(
-        FString::Printf(
-            TEXT("Replaying raw request #%d as request #%d using %s / %s"),
+        FString::Printf(TEXT("Replaying request #%d in place using %s / %s"),
             RequestId,
-            RetryRequestId,
             *UEnum::GetValueAsString(OriginalRecord.Provider),
             *OriginalRecord.Model),
         EN2CLogSeverity::Info,
@@ -360,107 +690,79 @@ bool UN2CLLMModule::ResendRawRequest(
     BaseService->ResendFormattedRequest(
         OriginalRecord.RawRequest,
         FOnLLMResponseReceived::CreateLambda(
-            [this, OriginalRecord, RetryRequestId, OnComplete = MoveTemp(OnComplete)](const FString& Response) mutable
+            [this, OriginalRecord, RequestId, OnComplete = MoveTemp(OnComplete)](const FString& Response) mutable
             {
                 bool bParsedSuccessfully = false;
-                FString ParseError;
                 FN2CTranslationResponse RetriedResponse;
                 RetriedResponse.Usage.InputTokens = 0;
                 RetriedResponse.Usage.OutputTokens = 0;
+                FString RequestLabel = OriginalRecord.RequestLabel;
 
                 TScriptInterface<IN2CLLMService> Service = GetActiveService();
-                UN2CResponseParserBase* Parser = Service.GetInterface()
-                    ? Service->GetResponseParser()
-                    : nullptr;
-
-                if (!Parser)
+                UN2CResponseParserBase* Parser = Service.GetInterface() ? Service->GetResponseParser() : nullptr;
+                if (Parser && Parser->ParseLLMResponse(Response, RetriedResponse))
                 {
-                    ParseError = TEXT("No response parser available for retried request");
-                }
-                else if (!Parser->ParseLLMResponse(Response, RetriedResponse))
-                {
-                    ParseError = TEXT("Failed to parse retried LLM response");
-                }
-                else if (OriginalRecord.bFinalConsolidation &&
-                         !FN2CBatchTranslationConsolidator::ValidateFinalResponse(
-                             RetriedResponse,
-                             ParseError))
-                {
-                    // ParseError is populated by the final-response validator.
+                    bParsedSuccessfully = true;
+                    if (!RetriedResponse.Graphs.IsEmpty() && !RetriedResponse.Graphs[0].GraphName.IsEmpty())
+                    {
+                        RequestLabel = RetriedResponse.Graphs[0].GraphName;
+                    }
+                    ParsedGraphResponsesByRequestId.Add(RequestId, RetriedResponse);
                 }
                 else
                 {
-                    bParsedSuccessfully = true;
+                    ParsedGraphResponsesByRequestId.Remove(RequestId);
+                    SaveRawResponseToDisk(Response);
+                }
 
-                    if (OriginalRecord.bFinalConsolidation)
+                RebuildSessionResponseFromGraphRequests();
+
+                // Rewrite the existing batch manifest with the newest graph-phase state. C++ batch
+                // code files remain untouched until the user runs/refreshed final consolidation.
+                if (!LatestTranslationPath.IsEmpty())
+                {
+                    const FString PreviousBatchRoot = CurrentBatchRootPath;
+                    CurrentBatchRootPath = LatestTranslationPath;
+                    const FN2CBlueprint& Blueprint = FN2CNodeTranslator::Get().GetN2CBlueprint();
+                    SaveTranslationToDisk(SessionTranslationResponse, Blueprint);
+                    CurrentBatchRootPath = PreviousBatchRoot;
+                }
+
+                const int32 RecordIndex = SessionRawResponses.IndexOfByPredicate(
+                    [RequestId](const FN2CRawResponseRecord& Record)
                     {
-                        SessionTranslationResponse = RetriedResponse;
+                        return Record.RequestId == RequestId;
+                    });
+                if (RecordIndex != INDEX_NONE)
+                {
+                    FN2CRawResponseRecord& Record = SessionRawResponses[RecordIndex];
+                    Record.RequestLabel = RequestLabel;
+                    Record.Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"));
+                    Record.RawRequest = OriginalRecord.RawRequest;
+                    Record.FormattedResponse = FormatRawResponseForDisplay(Response);
+                    Record.bParsedSuccessfully = bParsedSuccessfully;
+                    Record.RetriedFromRequestId = 0;
+                    Record.bFinalConsolidation = false;
+                }
 
-                        // A final-consolidation retry is a direct recovery path. Rewrite the final
-                        // manifest and C++ pair in the existing translation directory when one is
-                        // available, without rebuilding or changing the captured request itself.
-                        if (!LatestTranslationPath.IsEmpty())
-                        {
-                            const FString PreviousBatchRootPath = CurrentBatchRootPath;
-                            CurrentBatchRootPath = LatestTranslationPath;
+                PersistRequestHistory();
+                OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, bParsedSuccessfully);
 
-                            const FN2CBlueprint& Blueprint = FN2CNodeTranslator::Get().GetN2CBlueprint();
-                            const bool bManifestSaved = SaveTranslationToDisk(
-                                SessionTranslationResponse,
-                                Blueprint);
-                            const bool bCodeSaved = FN2CBatchTranslationConsolidator::SaveCppFiles(
-                                SessionTranslationResponse,
-                                LatestTranslationPath);
-
-                            CurrentBatchRootPath = PreviousBatchRootPath;
-
-                            if (!bManifestSaved || !bCodeSaved)
-                            {
-                                FN2CLogger::Get().LogWarning(
-                                    TEXT("Retried final consolidation parsed successfully, but one or more final output files could not be rewritten"),
-                                    TEXT("RawRequestRetry"));
-                            }
-                        }
-                    }
-                    else
-                    {
-                        AppendSessionResponse(RetriedResponse);
-                    }
-
-                    OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, true);
+                if (bParsedSuccessfully)
+                {
                     FN2CLogger::Get().Log(
-                        FString::Printf(TEXT("Successfully re-parsed retried request #%d"), RetryRequestId),
+                        FString::Printf(TEXT("Successfully replaced and re-parsed request #%d"), RequestId),
                         EN2CLogSeverity::Info,
                         TEXT("RawRequestRetry"));
                 }
-
-                if (!bParsedSuccessfully)
+                else
                 {
                     FN2CLogger::Get().LogError(
-                        FString::Printf(
-                            TEXT("Retried request #%d failed to parse: %s"),
-                            RetryRequestId,
-                            *ParseError),
+                        FString::Printf(TEXT("Replacement response for request #%d failed to parse"), RequestId),
                         TEXT("RawRequestRetry"));
-                    SaveRawResponseToDisk(Response);
-                    OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
                 }
 
-                FN2CRawResponseRecord RetryRecord;
-                RetryRecord.RequestId = RetryRequestId;
-                RetryRecord.RequestLabel = FString::Printf(
-                    TEXT("%s (Retry)"),
-                    *OriginalRecord.RequestLabel);
-                RetryRecord.Provider = OriginalRecord.Provider;
-                RetryRecord.Model = OriginalRecord.Model;
-                RetryRecord.Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"));
-                RetryRecord.RawRequest = OriginalRecord.RawRequest;
-                RetryRecord.FormattedResponse = FormatRawResponseForDisplay(Response);
-                RetryRecord.bParsedSuccessfully = bParsedSuccessfully;
-                RetryRecord.RetriedFromRequestId = OriginalRecord.RequestId;
-                RetryRecord.bFinalConsolidation = OriginalRecord.bFinalConsolidation;
-                SessionRawResponses.Add(MoveTemp(RetryRecord));
-
+                RetryInFlightRequestIds.Remove(RequestId);
                 FinishRequest(bParsedSuccessfully);
                 if (OnComplete)
                 {
@@ -471,117 +773,86 @@ bool UN2CLLMModule::ResendRawRequest(
     return true;
 }
 
-bool UN2CLLMModule::InitializeComponents()
+bool UN2CLLMModule::StartFinalConsolidation(
+    int32 ExistingRequestId,
+    TFunction<void(bool)> OnComplete)
 {
-    // Create and initialize prompt manager
-    PromptManager = NewObject<UN2CSystemPromptManager>(this);
-    if (!PromptManager)
-    {
-        FN2CLogger::Get().LogError(TEXT("Failed to create prompt manager"), TEXT("LLMModule"));
-        return false;
-    }
-    PromptManager->Initialize(Config);
-
-    // Note: HTTP Handler and Response Parser will be created by the specific service
-    return true;
-}
-
-void UN2CLLMModule::OpenTranslationFolder(bool& Success)
-{
-    FString PathToOpen = LatestTranslationPath;
-    
-    if (PathToOpen.IsEmpty())
-    {
-        FN2CLogger::Get().LogWarning(TEXT("No translation path available, opening the base path"));
-        Success = true;
-        PathToOpen = GetTranslationBasePath();
-    }
-
-    if (!FPaths::DirectoryExists(PathToOpen))
-    {
-        FN2CLogger::Get().LogError(FString::Printf(TEXT("Translation directory does not exist: %s \n\nOpening the base path"), *PathToOpen));
-        Success = true;
-        PathToOpen = GetTranslationBasePath();
-    }
-
-#if PLATFORM_WINDOWS
-    FPlatformProcess::ExploreFolder(*PathToOpen);
-    Success = true;
-#endif
-#if PLATFORM_MAC
-    FMacPlatformProcess::ExploreFolder(*PathToOpen);
-    Success = true;
-#endif
-    
-}
-
-void UN2CLLMModule::BeginBatchTranslation(const FString& BlueprintName)
-{
-    // Generate a shared root path for this batch
-    FString BlueprintNameToUse = BlueprintName;
-    if (BlueprintNameToUse.IsEmpty())
-    {
-        BlueprintNameToUse = TEXT("UnknownBlueprint");
-    }
-    CurrentBatchRootPath = GenerateTranslationRootPath(BlueprintNameToUse);
-    FN2CLogger::Get().Log(FString::Printf(TEXT("Batch translation started, root path: %s"), *CurrentBatchRootPath), EN2CLogSeverity::Info);
-}
-
-void UN2CLLMModule::EndBatchTranslation()
-{
-    if (CurrentBatchRootPath.IsEmpty())
-    {
-        FN2CLogger::Get().Log(TEXT("Batch translation ended"), EN2CLogSeverity::Info);
-        return;
-    }
-
-    const UN2CSettings* Settings = GetDefault<UN2CSettings>();
-    const EN2CCodeLanguage TargetLanguage = Settings ? Settings->TargetLanguage : EN2CCodeLanguage::Cpp;
-
-    // Preserve the existing non-C++ batch behavior. C++ full-Blueprint translations receive one
-    // additional semantic reconciliation request after all graph requests have completed.
-    if (TargetLanguage != EN2CCodeLanguage::Cpp || SessionTranslationResponse.Graphs.IsEmpty())
-    {
-        CurrentBatchRootPath.Empty();
-        FN2CLogger::Get().Log(TEXT("Batch translation ended"), EN2CLogSeverity::Info);
-        return;
-    }
-
     if (!ActiveService.GetInterface())
     {
-        bSessionHadError = true;
-        CurrentBatchRootPath.Empty();
         FN2CLogger::Get().LogError(
             TEXT("Cannot run final Blueprint consolidation because no active LLM service is available"),
             TEXT("BatchConsolidation"));
-        OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
-        return;
+        return false;
+    }
+
+    UN2CBaseLLMService* BaseService = Cast<UN2CBaseLLMService>(ActiveService.GetObject());
+    if (!BaseService || !BaseService->IsInitialized())
+    {
+        FN2CLogger::Get().LogError(
+            TEXT("Cannot format final Blueprint consolidation because the active service is unavailable"),
+            TEXT("BatchConsolidation"));
+        return false;
+    }
+
+    const FN2CTranslationResponse GraphAggregate = BuildGraphAggregateResponse();
+    if (GraphAggregate.Graphs.IsEmpty())
+    {
+        FN2CLogger::Get().LogError(
+            TEXT("Cannot run final Blueprint consolidation because there are no successful graph translations"),
+            TEXT("BatchConsolidation"));
+        return false;
+    }
+
+    const FString BatchRootPath = !CurrentBatchRootPath.IsEmpty()
+        ? CurrentBatchRootPath
+        : LatestTranslationPath;
+    if (BatchRootPath.IsEmpty())
+    {
+        FN2CLogger::Get().LogError(
+            TEXT("Cannot run final Blueprint consolidation because the translation batch path is unavailable"),
+            TEXT("BatchConsolidation"));
+        return false;
     }
 
     const FN2CBlueprint& Blueprint = FN2CNodeTranslator::Get().GetN2CBlueprint();
     FString ConsolidationPayload;
     if (!FN2CBatchTranslationConsolidator::BuildRequestPayload(
-            SessionTranslationResponse,
+            GraphAggregate,
             Blueprint,
             ConsolidationPayload))
     {
-        bSessionHadError = true;
-        CurrentBatchRootPath.Empty();
         FN2CLogger::Get().LogError(
             TEXT("Failed to build final Blueprint consolidation request"),
             TEXT("BatchConsolidation"));
-        OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
-        return;
+        return false;
     }
 
     const FString ConsolidationPrompt = FN2CBatchTranslationConsolidator::GetSystemPrompt();
-    const FString BatchRootPath = CurrentBatchRootPath;
-    const int32 PriorInputTokens = SessionTranslationResponse.Usage.InputTokens;
-    const int32 PriorOutputTokens = SessionTranslationResponse.Usage.OutputTokens;
-    const int32 RequestId = NextRequestId++;
+    const FString FormattedRequest = BaseService->BuildFormattedRequestPayload(
+        ConsolidationPayload,
+        ConsolidationPrompt);
+    if (FormattedRequest.IsEmpty())
+    {
+        FN2CLogger::Get().LogError(
+            TEXT("Failed to format final Blueprint consolidation request"),
+            TEXT("BatchConsolidation"));
+        return false;
+    }
+
+    const bool bReplacingExisting = ExistingRequestId != INDEX_NONE;
+    const int32 RequestId = bReplacingExisting ? ExistingRequestId : NextRequestId++;
     const EN2CLLMProvider RequestProvider = Config.Provider;
     const FString RequestModel = Config.Model;
-    const TSharedRef<FString> CapturedRawRequest = MakeShared<FString>();
+    const int32 PriorInputTokens = GraphAggregate.Usage.InputTokens;
+    const int32 PriorOutputTokens = GraphAggregate.Usage.OutputTokens;
+
+    // While consolidation is running, expose graph-phase state rather than any stale prior final response.
+    SessionTranslationResponse = GraphAggregate;
+
+    if (bReplacingExisting)
+    {
+        RetryInFlightRequestIds.Add(RequestId);
+    }
 
     ++InFlightRequestCount;
     CurrentStatus = EN2CSystemStatus::Processing;
@@ -589,18 +860,14 @@ void UN2CLLMModule::EndBatchTranslation()
 
     FN2CLogger::Get().Log(
         FString::Printf(
-            TEXT("Starting final Blueprint consolidation request with %d parsed graph translation(s)"),
-            SessionTranslationResponse.Graphs.Num()),
+            TEXT("Starting %sfinal Blueprint consolidation request with %d current parsed graph translation(s)"),
+            bReplacingExisting ? TEXT("replacement ") : TEXT(""),
+            GraphAggregate.Graphs.Num()),
         EN2CLogSeverity::Info,
         TEXT("BatchConsolidation"));
 
-    // Use the same active provider/model selected for this translation operation. Calling the
-    // service directly gives this pass its dedicated reconciliation system prompt while still
-    // flowing through UN2CBaseLLMService, so global/model/ad-hoc instructions and attached context
-    // files continue to apply consistently.
-    ActiveService->SendRequest(
-        ConsolidationPayload,
-        ConsolidationPrompt,
+    BaseService->ResendFormattedRequest(
+        FormattedRequest,
         FOnLLMResponseReceived::CreateLambda(
             [this,
              BatchRootPath,
@@ -609,7 +876,9 @@ void UN2CLLMModule::EndBatchTranslation()
              RequestId,
              RequestProvider,
              RequestModel,
-             CapturedRawRequest](const FString& Response)
+             FormattedRequest,
+             bReplacingExisting,
+             OnComplete = MoveTemp(OnComplete)](const FString& Response) mutable
             {
                 bool bSuccess = false;
                 FN2CTranslationResponse FinalResponse;
@@ -618,9 +887,7 @@ void UN2CLLMModule::EndBatchTranslation()
                 FString ValidationError;
 
                 TScriptInterface<IN2CLLMService> Service = GetActiveService();
-                UN2CResponseParserBase* Parser = Service.GetInterface()
-                    ? Service->GetResponseParser()
-                    : nullptr;
+                UN2CResponseParserBase* Parser = Service.GetInterface() ? Service->GetResponseParser() : nullptr;
 
                 if (!Parser)
                 {
@@ -630,27 +897,24 @@ void UN2CLLMModule::EndBatchTranslation()
                 {
                     ValidationError = TEXT("Failed to parse final Blueprint consolidation response");
                 }
-                else if (!FN2CBatchTranslationConsolidator::ValidateFinalResponse(
-                             FinalResponse,
-                             ValidationError))
+                else if (!FN2CBatchTranslationConsolidator::ValidateFinalResponse(FinalResponse, ValidationError))
                 {
-                    // ValidationError is populated by the structural validator.
+                    // ValidationError populated by structural validator.
                 }
                 else
                 {
-                    // Preserve aggregate usage from the graph translation phase while adding any
-                    // usage supplied by the final provider parser.
                     FinalResponse.Usage.InputTokens += PriorInputTokens;
                     FinalResponse.Usage.OutputTokens += PriorOutputTokens;
-                    SessionTranslationResponse = MoveTemp(FinalResponse);
+                    SessionTranslationResponse = FinalResponse;
 
+                    const FString PreviousBatchRoot = CurrentBatchRootPath;
+                    CurrentBatchRootPath = BatchRootPath;
                     const FN2CBlueprint& CurrentBlueprint = FN2CNodeTranslator::Get().GetN2CBlueprint();
-                    const bool bManifestSaved = SaveTranslationToDisk(
-                        SessionTranslationResponse,
-                        CurrentBlueprint);
+                    const bool bManifestSaved = SaveTranslationToDisk(SessionTranslationResponse, CurrentBlueprint);
                     const bool bCodeSaved = FN2CBatchTranslationConsolidator::SaveCppFiles(
                         SessionTranslationResponse,
                         BatchRootPath);
+                    CurrentBatchRootPath = PreviousBatchRoot;
 
                     bSuccess = bManifestSaved && bCodeSaved;
                     if (!bManifestSaved)
@@ -663,17 +927,33 @@ void UN2CLLMModule::EndBatchTranslation()
                     }
                 }
 
-                FN2CRawResponseRecord RawRecord;
-                RawRecord.RequestId = RequestId;
-                RawRecord.RequestLabel = TEXT("Final Consolidation");
-                RawRecord.Provider = RequestProvider;
-                RawRecord.Model = RequestModel;
-                RawRecord.Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"));
-                RawRecord.RawRequest = *CapturedRawRequest;
-                RawRecord.FormattedResponse = FormatRawResponseForDisplay(Response);
-                RawRecord.bParsedSuccessfully = bSuccess;
-                RawRecord.bFinalConsolidation = true;
-                SessionRawResponses.Add(MoveTemp(RawRecord));
+                FN2CRawResponseRecord Record;
+                Record.RequestId = RequestId;
+                Record.RequestLabel = TEXT("Final Consolidation");
+                Record.Provider = RequestProvider;
+                Record.Model = RequestModel;
+                Record.Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"));
+                Record.RawRequest = FormattedRequest;
+                Record.FormattedResponse = FormatRawResponseForDisplay(Response);
+                Record.bParsedSuccessfully = bSuccess;
+                Record.RetriedFromRequestId = 0;
+                Record.bFinalConsolidation = true;
+
+                const int32 ExistingIndex = SessionRawResponses.IndexOfByPredicate(
+                    [RequestId](const FN2CRawResponseRecord& Existing)
+                    {
+                        return Existing.RequestId == RequestId;
+                    });
+                if (ExistingIndex == INDEX_NONE)
+                {
+                    SessionRawResponses.Add(MoveTemp(Record));
+                }
+                else
+                {
+                    SessionRawResponses[ExistingIndex] = MoveTemp(Record);
+                }
+
+                PersistRequestHistory();
 
                 if (bSuccess)
                 {
@@ -685,101 +965,182 @@ void UN2CLLMModule::EndBatchTranslation()
                 }
                 else
                 {
-                    bSessionHadError = true;
+                    // Keep the current graph aggregate authoritative after a failed replacement.
+                    SessionTranslationResponse = BuildGraphAggregateResponse();
                     FN2CLogger::Get().LogError(
-                        FString::Printf(
-                            TEXT("Final Blueprint consolidation failed: %s"),
-                            *ValidationError),
+                        FString::Printf(TEXT("Final Blueprint consolidation failed: %s"), *ValidationError),
                         TEXT("BatchConsolidation"));
                     SaveRawResponseToDisk(Response);
                     OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
                 }
 
-                // The batch root must remain active through parsing/saving so failures and the final
-                // manifest are written into the same translation session directory.
-                CurrentBatchRootPath.Empty();
-                FN2CLogger::Get().Log(TEXT("Batch translation ended"), EN2CLogSeverity::Info);
+                if (!bReplacingExisting)
+                {
+                    CurrentBatchRootPath.Empty();
+                    FN2CLogger::Get().Log(TEXT("Batch translation ended"), EN2CLogSeverity::Info);
+                }
+                else
+                {
+                    RetryInFlightRequestIds.Remove(RequestId);
+                }
+
                 FinishRequest(bSuccess);
+                if (OnComplete)
+                {
+                    OnComplete(bSuccess);
+                }
             }));
 
-    if (UN2CBaseLLMService* BaseService = Cast<UN2CBaseLLMService>(ActiveService.GetObject()))
+    return true;
+}
+
+bool UN2CLLMModule::InitializeComponents()
+{
+    PromptManager = NewObject<UN2CSystemPromptManager>(this);
+    if (!PromptManager)
     {
-        *CapturedRawRequest = BaseService->GetLastFormattedRequestPayload();
+        FN2CLogger::Get().LogError(TEXT("Failed to create prompt manager"), TEXT("LLMModule"));
+        return false;
+    }
+    PromptManager->Initialize(Config);
+    return true;
+}
+
+void UN2CLLMModule::OpenTranslationFolder(bool& Success)
+{
+    FString PathToOpen = LatestTranslationPath;
+    if (PathToOpen.IsEmpty())
+    {
+        FN2CLogger::Get().LogWarning(TEXT("No translation path available, opening the base path"));
+        PathToOpen = GetTranslationBasePath();
+    }
+
+    if (!FPaths::DirectoryExists(PathToOpen))
+    {
+        FN2CLogger::Get().LogError(
+            FString::Printf(TEXT("Translation directory does not exist: %s. Opening the base path"), *PathToOpen));
+        PathToOpen = GetTranslationBasePath();
+    }
+
+#if PLATFORM_WINDOWS || PLATFORM_MAC
+    FPlatformProcess::ExploreFolder(*PathToOpen);
+    Success = true;
+#else
+    Success = false;
+#endif
+}
+
+void UN2CLLMModule::BeginBatchTranslation(const FString& BlueprintName)
+{
+    const FString BlueprintNameToUse = BlueprintName.IsEmpty() ? TEXT("UnknownBlueprint") : BlueprintName;
+    CurrentBatchRootPath = GenerateTranslationRootPath(BlueprintNameToUse);
+    FN2CLogger::Get().Log(
+        FString::Printf(TEXT("Batch translation started, root path: %s"), *CurrentBatchRootPath),
+        EN2CLogSeverity::Info);
+}
+
+void UN2CLLMModule::EndBatchTranslation()
+{
+    if (CurrentBatchRootPath.IsEmpty())
+    {
+        FN2CLogger::Get().Log(TEXT("Batch translation ended"), EN2CLogSeverity::Info);
+        return;
+    }
+
+    const UN2CSettings* Settings = GetDefault<UN2CSettings>();
+    const EN2CCodeLanguage TargetLanguage = Settings ? Settings->TargetLanguage : EN2CCodeLanguage::Cpp;
+    const FN2CTranslationResponse GraphAggregate = BuildGraphAggregateResponse();
+    SessionTranslationResponse = GraphAggregate;
+
+    if (TargetLanguage != EN2CCodeLanguage::Cpp || GraphAggregate.Graphs.IsEmpty())
+    {
+        PersistRequestHistory();
+        CurrentBatchRootPath.Empty();
+        FN2CLogger::Get().Log(TEXT("Batch translation ended"), EN2CLogSeverity::Info);
+        return;
+    }
+
+    if (!StartFinalConsolidation())
+    {
+        bSessionHadError = true;
+        PersistRequestHistory();
+        CurrentBatchRootPath.Empty();
+        OnTranslationResponseReceived.Broadcast(SessionTranslationResponse, false);
     }
 }
 
-bool UN2CLLMModule::SaveTranslationToDisk(const FN2CTranslationResponse& Response, const FN2CBlueprint& Blueprint)
+void UN2CLLMModule::PersistRequestHistory() const
 {
-    // Get blueprint name from metadata
+    const FString HistoryRoot = !CurrentBatchRootPath.IsEmpty()
+        ? CurrentBatchRootPath
+        : LatestTranslationPath;
+
+    if (HistoryRoot.IsEmpty() || !FPaths::DirectoryExists(HistoryRoot))
+    {
+        return;
+    }
+
+    if (!FN2CTranslationHistory::SaveRequestHistory(HistoryRoot, SessionRawResponses))
+    {
+        FN2CLogger::Get().LogWarning(
+            FString::Printf(TEXT("Failed to persist request history: %s"), *HistoryRoot),
+            TEXT("TranslationHistory"));
+    }
+}
+
+bool UN2CLLMModule::SaveTranslationToDisk(
+    const FN2CTranslationResponse& Response,
+    const FN2CBlueprint& Blueprint)
+{
     FString BlueprintName = Blueprint.Metadata.Name;
     if (BlueprintName.IsEmpty())
     {
         BlueprintName = TEXT("UnknownBlueprint");
     }
 
-    // Use batch root path if in batch mode, otherwise generate a new timestamped path for each translation
-    FString RootPath;
-    if (!CurrentBatchRootPath.IsEmpty())
-    {
-        // Batch mode: reuse the shared root path
-        RootPath = CurrentBatchRootPath;
-    }
-    else
-    {
-        // Single translation mode: generate a new timestamped directory for each translation
-        RootPath = GenerateTranslationRootPath(BlueprintName);
-    }
+    const FString RootPath = !CurrentBatchRootPath.IsEmpty()
+        ? CurrentBatchRootPath
+        : GenerateTranslationRootPath(BlueprintName);
 
-    // Ensure the directory exists
     if (!EnsureDirectoryExists(RootPath))
     {
         FN2CLogger::Get().LogError(FString::Printf(TEXT("Failed to create translation directory: %s"), *RootPath));
         return false;
     }
 
-    // Store the path for later reference
     LatestTranslationPath = RootPath;
 
-    // Save the Blueprint JSON (pretty-printed)
-    FString JsonFileName = FString::Printf(TEXT("N2C_BP_%s.json"), *FPaths::GetBaseFilename(RootPath));
-    FString JsonFilePath = FPaths::Combine(RootPath, JsonFileName);
-
-    // Serialize the Blueprint to JSON with pretty printing
+    const FString JsonFileName = FString::Printf(TEXT("N2C_BP_%s.json"), *FPaths::GetBaseFilename(RootPath));
+    const FString JsonFilePath = FPaths::Combine(RootPath, JsonFileName);
     FN2CSerializer::SetPrettyPrint(true);
-    FString JsonContent = FN2CSerializer::ToJson(Blueprint);
-
+    const FString JsonContent = FN2CSerializer::ToJson(Blueprint);
     if (!FFileHelper::SaveStringToFile(JsonContent, *JsonFilePath))
     {
         FN2CLogger::Get().LogError(FString::Printf(TEXT("Failed to save JSON file: %s"), *JsonFilePath));
         return false;
     }
 
-    // Save minified version of the Blueprint JSON
-    FString MinifiedJsonFileName = FString::Printf(TEXT("N2C_BP_Minified_%s.json"), *FPaths::GetBaseFilename(RootPath));
-    FString MinifiedJsonFilePath = FPaths::Combine(RootPath, MinifiedJsonFileName);
-
-    // Serialize the Blueprint JSON without pretty printing
+    const FString MinifiedJsonFileName = FString::Printf(
+        TEXT("N2C_BP_Minified_%s.json"),
+        *FPaths::GetBaseFilename(RootPath));
+    const FString MinifiedJsonFilePath = FPaths::Combine(RootPath, MinifiedJsonFileName);
     FN2CSerializer::SetPrettyPrint(false);
-    FString MinifiedJsonContent = FN2CSerializer::ToJson(Blueprint);
-
+    const FString MinifiedJsonContent = FN2CSerializer::ToJson(Blueprint);
     if (!FFileHelper::SaveStringToFile(MinifiedJsonContent, *MinifiedJsonFilePath))
     {
-        FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save minified JSON file: %s"), *MinifiedJsonFilePath));
-        // Continue even if minified version fails
+        FN2CLogger::Get().LogWarning(
+            FString::Printf(TEXT("Failed to save minified JSON file: %s"), *MinifiedJsonFilePath));
     }
 
-    // During a batch, write the accumulated session response so this manifest contains every graph
-    // completed so far rather than being overwritten by only the most recent response.
     const FN2CTranslationResponse& ManifestResponse =
         !CurrentBatchRootPath.IsEmpty() ? SessionTranslationResponse : Response;
 
-    FString TranslationJsonFileName = FString::Printf(TEXT("N2C_Translation_%s.json"), *FPaths::GetBaseFilename(RootPath));
-    FString TranslationJsonFilePath = FPaths::Combine(RootPath, TranslationJsonFileName);
+    const FString TranslationJsonFileName = FString::Printf(
+        TEXT("N2C_Translation_%s.json"),
+        *FPaths::GetBaseFilename(RootPath));
+    const FString TranslationJsonFilePath = FPaths::Combine(RootPath, TranslationJsonFileName);
 
-    // Serialize the Translation response to JSON
     TSharedPtr<FJsonObject> TranslationJsonObject = MakeShared<FJsonObject>();
-
-    // Create graphs array
     TArray<TSharedPtr<FJsonValue>> GraphsArray;
     for (const FN2CGraphTranslation& Graph : ManifestResponse.Graphs)
     {
@@ -788,19 +1149,15 @@ bool UN2CLLMModule::SaveTranslationToDisk(const FN2CTranslationResponse& Respons
         GraphObject->SetStringField(TEXT("graph_type"), Graph.GraphType);
         GraphObject->SetStringField(TEXT("graph_class"), Graph.GraphClass);
 
-        // Create code object
         TSharedPtr<FJsonObject> CodeObject = MakeShared<FJsonObject>();
         CodeObject->SetStringField(TEXT("graphDeclaration"), Graph.Code.GraphDeclaration);
         CodeObject->SetStringField(TEXT("graphImplementation"), Graph.Code.GraphImplementation);
         CodeObject->SetStringField(TEXT("implementationNotes"), Graph.Code.ImplementationNotes);
-
         GraphObject->SetObjectField(TEXT("code"), CodeObject);
         GraphsArray.Add(MakeShared<FJsonValueObject>(GraphObject));
     }
-
     TranslationJsonObject->SetArrayField(TEXT("graphs"), GraphsArray);
 
-    // Add usage information if available
     if (ManifestResponse.Usage.InputTokens > 0 || ManifestResponse.Usage.OutputTokens > 0)
     {
         TSharedPtr<FJsonObject> UsageObject = MakeShared<FJsonObject>();
@@ -809,29 +1166,21 @@ bool UN2CLLMModule::SaveTranslationToDisk(const FN2CTranslationResponse& Respons
         TranslationJsonObject->SetObjectField(TEXT("usage"), UsageObject);
     }
 
-    // Serialize to string with pretty printing
     FString TranslationJsonContent;
     TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&TranslationJsonContent);
     FJsonSerializer::Serialize(TranslationJsonObject.ToSharedRef(), Writer);
-
     if (!FFileHelper::SaveStringToFile(TranslationJsonContent, *TranslationJsonFilePath))
     {
-        FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save translation JSON file: %s"), *TranslationJsonFilePath));
-        // Continue even if translation JSON fails
+        FN2CLogger::Get().LogWarning(
+            FString::Printf(TEXT("Failed to save translation JSON file: %s"), *TranslationJsonFilePath));
     }
 
-    // Get the target language from settings
     const UN2CSettings* Settings = GetDefault<UN2CSettings>();
-    EN2CCodeLanguage TargetLanguage = Settings ? Settings->TargetLanguage : EN2CCodeLanguage::Cpp;
-
-    // Determine if we're in batch mode (when CurrentBatchRootPath is set)
+    const EN2CCodeLanguage TargetLanguage = Settings ? Settings->TargetLanguage : EN2CCodeLanguage::Cpp;
     const bool bIsBatchMode = !CurrentBatchRootPath.IsEmpty();
 
     if (bIsBatchMode)
     {
-        // Full-Blueprint C++ output is emitted once in EndBatchTranslation after every graph
-        // response has been parsed. Do not create intermediate per-graph .h/.cpp directories.
-        // Preserve the existing behavior for non-C++ targets.
         if (TargetLanguage != EN2CCodeLanguage::Cpp)
         {
             SaveGraphFilesWithBatchFeatures(Response, RootPath, TargetLanguage);
@@ -853,40 +1202,30 @@ void UN2CLLMModule::SaveRawResponseToDisk(const FString& RawResponse)
         return;
     }
 
-    FString RootPath;
-    if (!CurrentBatchRootPath.IsEmpty())
-    {
-        RootPath = CurrentBatchRootPath;
-    }
-    else
-    {
-        RootPath = GenerateTranslationRootPath(TEXT("ParseFailure"));
-    }
+    const FString RootPath = !CurrentBatchRootPath.IsEmpty()
+        ? CurrentBatchRootPath
+        : GenerateTranslationRootPath(TEXT("ParseFailure"));
 
     if (!EnsureDirectoryExists(RootPath))
     {
         return;
     }
 
-    // Save the raw response with a unique timestamp
-    FDateTime Now = FDateTime::Now();
-    FString Timestamp = Now.ToString(TEXT("%Y-%m-%d-%H.%M.%S.%f"));
-    FString RawFileName = FString::Printf(TEXT("RAW_RESPONSE_%s.txt"), *Timestamp);
-    FString RawFilePath = FPaths::Combine(RootPath, RawFileName);
+    const FString Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d-%H.%M.%S.%f"));
+    const FString RawFileName = FString::Printf(TEXT("RAW_RESPONSE_%s.txt"), *Timestamp);
+    const FString RawFilePath = FPaths::Combine(RootPath, RawFileName);
 
     if (FFileHelper::SaveStringToFile(RawResponse, *RawFilePath))
     {
         FN2CLogger::Get().LogWarning(
             FString::Printf(TEXT("Raw LLM response saved for debugging: %s"), *RawFilePath),
-            TEXT("LLMModule")
-        );
+            TEXT("LLMModule"));
     }
     else
     {
         FN2CLogger::Get().LogError(
             FString::Printf(TEXT("Failed to save raw response to: %s"), *RawFilePath),
-            TEXT("LLMModule")
-        );
+            TEXT("LLMModule"));
     }
 }
 
@@ -895,36 +1234,27 @@ void UN2CLLMModule::SaveGraphFilesWithBatchFeatures(
     const FString& RootPath,
     EN2CCodeLanguage TargetLanguage) const
 {
-    const bool bIsCpp = (TargetLanguage == EN2CCodeLanguage::Cpp);
-    
-    // Helper to sanitize graph names for use as filesystem paths while keeping the
-    // original GraphName intact for logical/JSON purposes.
-    auto SanitizeNameForFilesystem = [](const FString& InName) -> FString
-    {
-        FString Result = InName;
-        Result = Result.TrimStartAndEnd();
+    const bool bIsCpp = TargetLanguage == EN2CCodeLanguage::Cpp;
 
-        // Replace Windows-invalid filename characters with underscores
+    auto SanitizeNameForFilesystem = [](const FString& InName)
+    {
+        FString Result = InName.TrimStartAndEnd();
         const TCHAR InvalidChars[] =
         {
-            TEXT('<'), TEXT('>'), TEXT(':'), TEXT('"'),
-            TEXT('/'), TEXT('\\'), TEXT('|'), TEXT('?'), TEXT('*')
+            TEXT('<'), TEXT('>'), TEXT(':'), TEXT('"'), TEXT('/'),
+            TEXT('\\'), TEXT('|'), TEXT('?'), TEXT('*')
         };
-
         for (TCHAR Ch : InvalidChars)
         {
             FString From;
             From.AppendChar(Ch);
             Result.ReplaceInline(*From, TEXT("_"), ESearchCase::CaseSensitive);
         }
-
         return Result;
     };
 
-    // Save each graph's files
     for (const FN2CGraphTranslation& Graph : Response.Graphs)
     {
-        // Skip graphs with empty names
         if (Graph.GraphName.IsEmpty())
         {
             continue;
@@ -934,135 +1264,64 @@ void UN2CLLMModule::SaveGraphFilesWithBatchFeatures(
         const bool bIsClassItSelf = Graph.GraphType.Equals(TEXT("ClassItSelf"), ESearchCase::IgnoreCase);
         const bool bHasGraphClass = !Graph.GraphClass.IsEmpty();
 
-        // Log graph information for debugging
-        FN2CLogger::Get().Log(
-            FString::Printf(TEXT("[SaveGraphFiles] Processing graph: Name='%s', Type='%s', Class='%s', IsClassItSelf=%d, HasGraphClass=%d"),
-                *Graph.GraphName, *Graph.GraphType, *Graph.GraphClass, bIsClassItSelf ? 1 : 0, bHasGraphClass ? 1 : 0),
-            EN2CLogSeverity::Debug);
-
-        // For ClassItSelf graphs with a class name, save directly to class-centric directory
-        // Skip the graph-specific directory to avoid duplicate files
         if (bIsClassItSelf && bHasGraphClass)
         {
-            FString ClassDir = FPaths::Combine(RootPath, Graph.GraphClass);
+            const FString ClassDir = FPaths::Combine(RootPath, Graph.GraphClass);
             if (!EnsureDirectoryExists(ClassDir))
             {
-                FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to create class directory: %s"), *ClassDir));
                 continue;
             }
 
-            // Save declaration file (C++ only)
             if (bIsCpp && !Graph.Code.GraphDeclaration.IsEmpty())
             {
-                FString ClassHeaderPath = FPaths::Combine(ClassDir, Graph.GraphClass + TEXT(".h"));
-                FN2CLogger::Get().Log(
-                    FString::Printf(TEXT("[SaveGraphFiles] Saving ClassItSelf header to class-centric path: %s (Graph: %s)"),
-                        *ClassHeaderPath, *Graph.GraphName),
-                    EN2CLogSeverity::Debug);
-                if (!FFileHelper::SaveStringToFile(Graph.Code.GraphDeclaration, *ClassHeaderPath))
+                const FString HeaderPath = FPaths::Combine(ClassDir, Graph.GraphClass + TEXT(".h"));
+                if (!FFileHelper::SaveStringToFile(Graph.Code.GraphDeclaration, *HeaderPath))
                 {
-                    FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save class header file: %s"), *ClassHeaderPath));
-                }
-                else
-                {
-                    FN2CLogger::Get().Log(
-                        FString::Printf(TEXT("[SaveGraphFiles] Successfully saved class header file: %s"), *ClassHeaderPath),
-                        EN2CLogSeverity::Debug);
+                    FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save class header file: %s"), *HeaderPath));
                 }
             }
 
-            // Save implementation file
             if (!Graph.Code.GraphImplementation.IsEmpty())
             {
-                FString Extension = GetFileExtensionForLanguage(TargetLanguage);
-                FString ClassImplPath = FPaths::Combine(ClassDir, Graph.GraphClass + Extension);
-                FN2CLogger::Get().Log(
-                    FString::Printf(TEXT("[SaveGraphFiles] Saving ClassItSelf implementation to class-centric path: %s (Graph: %s)"),
-                        *ClassImplPath, *Graph.GraphName),
-                    EN2CLogSeverity::Debug);
-                if (!FFileHelper::SaveStringToFile(Graph.Code.GraphImplementation, *ClassImplPath))
+                const FString ImplPath = FPaths::Combine(
+                    ClassDir,
+                    Graph.GraphClass + GetFileExtensionForLanguage(TargetLanguage));
+                if (!FFileHelper::SaveStringToFile(Graph.Code.GraphImplementation, *ImplPath))
                 {
-                    FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save class implementation file: %s"), *ClassImplPath));
-                }
-                else
-                {
-                    FN2CLogger::Get().Log(
-                        FString::Printf(TEXT("[SaveGraphFiles] Successfully saved class implementation file: %s"), *ClassImplPath),
-                        EN2CLogSeverity::Debug);
+                    FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save class implementation file: %s"), *ImplPath));
                 }
             }
 
-            // Save implementation notes to class directory
             if (!Graph.Code.ImplementationNotes.IsEmpty())
             {
-                FString NotesPath = FPaths::Combine(ClassDir, Graph.GraphClass + TEXT("_Notes.txt"));
-                if (!FFileHelper::SaveStringToFile(Graph.Code.ImplementationNotes, *NotesPath))
-                {
-                    FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save notes file: %s"), *NotesPath));
-                }
+                const FString NotesPath = FPaths::Combine(ClassDir, Graph.GraphClass + TEXT("_Notes.txt"));
+                FFileHelper::SaveStringToFile(Graph.Code.ImplementationNotes, *NotesPath);
             }
-
-            // Skip normal graph directory processing for ClassItSelf graphs
             continue;
         }
 
-        // For non-ClassItSelf graphs (or ClassItSelf without class name), use normal graph directory
-        FString GraphDir = FPaths::Combine(RootPath, SanitizedGraphName);
+        const FString GraphDir = FPaths::Combine(RootPath, SanitizedGraphName);
         if (!EnsureDirectoryExists(GraphDir))
         {
-            FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to create graph directory: %s"), *GraphDir));
             continue;
         }
 
-        const FString FileBaseName = SanitizedGraphName;
-
-        // Save declaration file (C++ only)
         if (bIsCpp && !Graph.Code.GraphDeclaration.IsEmpty())
         {
-            FString HeaderPath = FPaths::Combine(GraphDir, FileBaseName + TEXT(".h"));
-            FN2CLogger::Get().Log(
-                FString::Printf(TEXT("[SaveGraphFiles] Saving header file: %s (Graph: %s)"), *HeaderPath, *Graph.GraphName),
-                EN2CLogSeverity::Debug);
-            if (!FFileHelper::SaveStringToFile(Graph.Code.GraphDeclaration, *HeaderPath))
-            {
-                FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save header file: %s"), *HeaderPath));
-            }
-            else
-            {
-                FN2CLogger::Get().Log(
-                    FString::Printf(TEXT("[SaveGraphFiles] Successfully saved header file: %s"), *HeaderPath),
-                    EN2CLogSeverity::Debug);
-            }
+            const FString HeaderPath = FPaths::Combine(GraphDir, SanitizedGraphName + TEXT(".h"));
+            FFileHelper::SaveStringToFile(Graph.Code.GraphDeclaration, *HeaderPath);
         }
-
-        // Save implementation file with appropriate extension
         if (!Graph.Code.GraphImplementation.IsEmpty())
         {
-            FString Extension = GetFileExtensionForLanguage(TargetLanguage);
-            FString ImplPath = FPaths::Combine(GraphDir, FileBaseName + Extension);
-            FN2CLogger::Get().Log(
-                FString::Printf(TEXT("[SaveGraphFiles] Saving implementation file: %s (Graph: %s)"), *ImplPath, *Graph.GraphName),
-                EN2CLogSeverity::Debug);
-            if (!FFileHelper::SaveStringToFile(Graph.Code.GraphImplementation, *ImplPath))
-            {
-                FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save implementation file: %s"), *ImplPath));
-            }
-            else
-            {
-                FN2CLogger::Get().Log(
-                    FString::Printf(TEXT("[SaveGraphFiles] Successfully saved implementation file: %s"), *ImplPath),
-                    EN2CLogSeverity::Debug);
-            }
+            const FString ImplPath = FPaths::Combine(
+                GraphDir,
+                SanitizedGraphName + GetFileExtensionForLanguage(TargetLanguage));
+            FFileHelper::SaveStringToFile(Graph.Code.GraphImplementation, *ImplPath);
         }
-        
-        // Save implementation notes
         if (!Graph.Code.ImplementationNotes.IsEmpty())
         {
-            FString NotesPath = FPaths::Combine(GraphDir, FileBaseName + TEXT("_Notes.txt"));
-            if (!FFileHelper::SaveStringToFile(Graph.Code.ImplementationNotes, *NotesPath))
-            {
-                FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save notes file: %s"), *NotesPath));
-            }
+            const FString NotesPath = FPaths::Combine(GraphDir, SanitizedGraphName + TEXT("_Notes.txt"));
+            FFileHelper::SaveStringToFile(Graph.Code.ImplementationNotes, *NotesPath);
         }
     }
 }
@@ -1072,183 +1331,138 @@ void UN2CLLMModule::SaveGraphFilesOriginal(
     const FString& RootPath,
     EN2CCodeLanguage TargetLanguage) const
 {
-    // Save each graph's files using original simple logic
     for (const FN2CGraphTranslation& Graph : Response.Graphs)
     {
-        // Skip graphs with empty names
         if (Graph.GraphName.IsEmpty())
         {
             continue;
         }
-        
-        // Create directory for this graph
-        FString GraphDir = FPaths::Combine(RootPath, Graph.GraphName);
+
+        const FString GraphDir = FPaths::Combine(RootPath, Graph.GraphName);
         if (!EnsureDirectoryExists(GraphDir))
         {
-            FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to create graph directory: %s"), *GraphDir));
             continue;
         }
-        
-        // Save declaration file (C++ only)
+
         if (TargetLanguage == EN2CCodeLanguage::Cpp && !Graph.Code.GraphDeclaration.IsEmpty())
         {
-            FString HeaderPath = FPaths::Combine(GraphDir, Graph.GraphName + TEXT(".h"));
+            const FString HeaderPath = FPaths::Combine(GraphDir, Graph.GraphName + TEXT(".h"));
             if (!FFileHelper::SaveStringToFile(Graph.Code.GraphDeclaration, *HeaderPath))
             {
                 FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save header file: %s"), *HeaderPath));
             }
         }
-        
-        // Save implementation file with appropriate extension
+
         if (!Graph.Code.GraphImplementation.IsEmpty())
         {
-            FString Extension = GetFileExtensionForLanguage(TargetLanguage);
-            FString ImplPath = FPaths::Combine(GraphDir, Graph.GraphName + Extension);
+            const FString ImplPath = FPaths::Combine(
+                GraphDir,
+                Graph.GraphName + GetFileExtensionForLanguage(TargetLanguage));
             if (!FFileHelper::SaveStringToFile(Graph.Code.GraphImplementation, *ImplPath))
             {
                 FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save implementation file: %s"), *ImplPath));
             }
         }
-        
-        // Save implementation notes
+
         if (!Graph.Code.ImplementationNotes.IsEmpty())
         {
-            FString NotesPath = FPaths::Combine(GraphDir, Graph.GraphName + TEXT("_Notes.txt"));
+            const FString NotesPath = FPaths::Combine(GraphDir, Graph.GraphName + TEXT("_Notes.txt"));
             if (!FFileHelper::SaveStringToFile(Graph.Code.ImplementationNotes, *NotesPath))
             {
                 FN2CLogger::Get().LogWarning(FString::Printf(TEXT("Failed to save notes file: %s"), *NotesPath));
             }
         }
     }
-    
+
     FN2CLogger::Get().Log(FString::Printf(TEXT("Translation saved to: %s"), *RootPath), EN2CLogSeverity::Info);
 }
 
 FString UN2CLLMModule::GenerateTranslationRootPath(const FString& BlueprintName) const
 {
-    // Get current date/time
-    FDateTime Now = FDateTime::Now();
-    FString Timestamp = Now.ToString(TEXT("%Y-%m-%d-%H.%M.%S"));
-    
-    // Create folder name
-    FString FolderName = FString::Printf(TEXT("%s_%s"), *BlueprintName, *Timestamp);
-
-    // Get the saved translations base path
-    FString BasePath = GetTranslationBasePath();
-    
-    return FPaths::Combine(BasePath, FolderName);
+    const FString Timestamp = FDateTime::Now().ToString(TEXT("%Y-%m-%d-%H.%M.%S"));
+    return FPaths::Combine(
+        GetTranslationBasePath(),
+        FString::Printf(TEXT("%s_%s"), *BlueprintName, *Timestamp));
 }
 
 FString UN2CLLMModule::GetTranslationBasePath() const
 {
-    // Check if custom output directory is set in settings
     const UN2CSettings* Settings = GetDefault<UN2CSettings>();
-    FString BasePath;
-    
     if (Settings && !Settings->CustomTranslationOutputDirectory.Path.IsEmpty())
     {
-        // Use custom path if specified
-        BasePath = Settings->CustomTranslationOutputDirectory.Path;
-        FN2CLogger::Get().Log(
-            FString::Printf(TEXT("Using custom translation output directory: %s"), *BasePath),
-            EN2CLogSeverity::Info);
-    }
-    else
-    {
-        // Use default path
-        BasePath = FPaths::ProjectSavedDir() / TEXT("NodeToCode") / TEXT("Translations");
+        return Settings->CustomTranslationOutputDirectory.Path;
     }
 
-    return BasePath;
+    return FPaths::ProjectSavedDir() / TEXT("NodeToCode") / TEXT("Translations");
 }
 
 FString UN2CLLMModule::GetFileExtensionForLanguage(EN2CCodeLanguage Language) const
 {
     switch (Language)
     {
-        case EN2CCodeLanguage::Cpp:
-            return TEXT(".cpp");
-        case EN2CCodeLanguage::Python:
-            return TEXT(".py");
-        case EN2CCodeLanguage::JavaScript:
-            return TEXT(".js");
-        case EN2CCodeLanguage::CSharp:
-            return TEXT(".cs");
-        case EN2CCodeLanguage::Swift:
-            return TEXT(".swift");
-        case EN2CCodeLanguage::Pseudocode:
-            return TEXT(".md");
-        default:
-            return TEXT(".txt");
+        case EN2CCodeLanguage::Cpp: return TEXT(".cpp");
+        case EN2CCodeLanguage::Python: return TEXT(".py");
+        case EN2CCodeLanguage::JavaScript: return TEXT(".js");
+        case EN2CCodeLanguage::CSharp: return TEXT(".cs");
+        case EN2CCodeLanguage::Swift: return TEXT(".swift");
+        case EN2CCodeLanguage::Pseudocode: return TEXT(".md");
+        default: return TEXT(".txt");
     }
 }
 
 bool UN2CLLMModule::EnsureDirectoryExists(const FString& DirectoryPath) const
 {
-    if (!FPaths::DirectoryExists(DirectoryPath))
+    if (FPaths::DirectoryExists(DirectoryPath))
     {
-        bool bSuccess = FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*DirectoryPath);
-        if (!bSuccess)
-        {
-            FN2CLogger::Get().LogError(
-                FString::Printf(TEXT("Failed to create directory: %s"), *DirectoryPath));
-            return false;
-        }
-        FN2CLogger::Get().Log(
-            FString::Printf(TEXT("Created directory: %s"), *DirectoryPath),
-            EN2CLogSeverity::Info);
         return true;
     }
+
+    const bool bSuccess = FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*DirectoryPath);
+    if (!bSuccess)
+    {
+        FN2CLogger::Get().LogError(FString::Printf(TEXT("Failed to create directory: %s"), *DirectoryPath));
+        return false;
+    }
+
+    FN2CLogger::Get().Log(
+        FString::Printf(TEXT("Created directory: %s"), *DirectoryPath),
+        EN2CLogSeverity::Info);
     return true;
 }
 
 bool UN2CLLMModule::CreateServiceForProvider(EN2CLLMProvider Provider)
 {
-    // Get the provider registry
     UN2CLLMProviderRegistry* Registry = UN2CLLMProviderRegistry::Get();
-    
-    // Check if the provider is registered
     if (!Registry->IsProviderRegistered(Provider))
     {
         FN2CLogger::Get().LogError(
-            FString::Printf(TEXT("Provider type not registered: %s"), 
-                *UEnum::GetValueAsString(Provider)),
-            TEXT("LLMModule")
-        );
-        return false;
-    }
-    
-    // Create the provider service
-    TScriptInterface<IN2CLLMService> ServiceInterface = Registry->CreateProvider(Provider, this);
-    
-    if (!ServiceInterface.GetInterface())
-    {
-        FN2CLogger::Get().LogError(
-            FString::Printf(TEXT("Failed to create service for provider type: %s"), 
-                *UEnum::GetValueAsString(Provider)),
-            TEXT("LLMModule")
-        );
+            FString::Printf(TEXT("Provider type not registered: %s"), *UEnum::GetValueAsString(Provider)),
+            TEXT("LLMModule"));
         return false;
     }
 
-    // Initialize service
+    TScriptInterface<IN2CLLMService> ServiceInterface = Registry->CreateProvider(Provider, this);
+    if (!ServiceInterface.GetInterface())
+    {
+        FN2CLogger::Get().LogError(
+            FString::Printf(TEXT("Failed to create service for provider type: %s"), *UEnum::GetValueAsString(Provider)),
+            TEXT("LLMModule"));
+        return false;
+    }
+
     if (!ServiceInterface.GetInterface()->Initialize(Config))
     {
         FN2CLogger::Get().LogError(TEXT("Failed to initialize service"), TEXT("LLMModule"));
         return false;
     }
 
-    // Store active service
     ActiveService = ServiceInterface;
     return true;
 }
 
 void UN2CLLMModule::InitializeProviderRegistry()
 {
-    // Get the provider registry
     UN2CLLMProviderRegistry* Registry = UN2CLLMProviderRegistry::Get();
-    
-    // Register all provider classes
     Registry->RegisterProvider(EN2CLLMProvider::OpenAI, UN2COpenAIService::StaticClass());
     Registry->RegisterProvider(EN2CLLMProvider::Anthropic, UN2CAnthropicService::StaticClass());
     Registry->RegisterProvider(EN2CLLMProvider::Gemini, UN2CGeminiService::StaticClass());
@@ -1256,6 +1470,6 @@ void UN2CLLMModule::InitializeProviderRegistry()
     Registry->RegisterProvider(EN2CLLMProvider::Ollama, UN2COllamaService::StaticClass());
     Registry->RegisterProvider(EN2CLLMProvider::LMStudio, UN2CLMStudioService::StaticClass());
     Registry->RegisterProvider(EN2CLLMProvider::MiniMax, UN2CMiniMaxService::StaticClass());
-    
+
     FN2CLogger::Get().Log(TEXT("Provider registry initialized"), EN2CLogSeverity::Info, TEXT("LLMModule"));
 }
