@@ -331,8 +331,11 @@ bool UN2CLLMModule::TryQueueNativeBatchRequest(
     const FString& SystemPrompt,
     const FOnLLMResponseReceived& OnComplete)
 {
+    const UN2CSettings* Settings = GetDefault<UN2CSettings>();
     if (CurrentBatchRootPath.IsEmpty() ||
-        !FN2CNativeBatchProcessor::SupportsProvider(Config.Provider))
+        !FN2CNativeBatchProcessor::SupportsProvider(Config.Provider) ||
+        !Settings ||
+        !Settings->IsBatchProcessingEnabledForProvider(Config.Provider))
     {
         return false;
     }
