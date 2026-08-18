@@ -437,6 +437,67 @@ void FN2CEditorIntegration::ExecuteCopyJsonForEditor(TWeakPtr<FBlueprintEditor> 
     }
 }
 
+void FN2CEditorIntegration::ExecuteCopyEntireBlueprintJsonForEditor(TWeakPtr<FBlueprintEditor> InEditor)
+{
+    FN2CLogger::Get().Log(TEXT("ExecuteCopyEntireBlueprintJsonForEditor called"), EN2CLogSeverity::Debug);
+
+    TSharedPtr<FBlueprintEditor> Editor = InEditor.Pin();
+    if (!Editor.IsValid())
+    {
+        FN2CLogger::Get().LogError(TEXT("Invalid Blueprint Editor pointer"));
+        return;
+    }
+
+    UBlueprint* OwnerBP = Editor->GetBlueprintObj();
+    if (!OwnerBP)
+    {
+        FN2CLogger::Get().LogError(TEXT("Blueprint Editor has no Blueprint object"));
+        return;
+    }
+
+    FN2CNodeTranslator& Translator = FN2CNodeTranslator::Get();
+    if (!Translator.GenerateFromBlueprint(OwnerBP, true))
+    {
+        FN2CLogger::Get().LogError(TEXT("Failed to generate complete Blueprint JSON data"));
+        return;
+    }
+
+    const FN2CBlueprint& Blueprint = Translator.GetN2CBlueprint();
+    if (!Blueprint.IsValid())
+    {
+        FN2CLogger::Get().LogError(TEXT("Complete Blueprint JSON validation failed"));
+        return;
+    }
+
+    FN2CSerializer::SetPrettyPrint(true);
+    const FString JsonOutput = FN2CSerializer::ToJson(Blueprint);
+    if (JsonOutput.IsEmpty())
+    {
+        FN2CLogger::Get().LogError(TEXT("Complete Blueprint JSON serialization failed"));
+        return;
+    }
+
+    FPlatformApplicationMisc::ClipboardCopy(*JsonOutput);
+
+    FNotificationInfo Info(NSLOCTEXT(
+        "NodeToCode",
+        "EntireBlueprintJsonCopied",
+        "Entire Blueprint JSON copied to clipboard"));
+    Info.bFireAndForget = true;
+    Info.FadeInDuration = 0.2f;
+    Info.FadeOutDuration = 0.5f;
+    Info.ExpireDuration = 2.0f;
+    FSlateNotificationManager::Get().AddNotification(Info);
+
+    FN2CLogger::Get().Log(
+        FString::Printf(
+            TEXT("Entire Blueprint JSON copied to clipboard: %s (%d variables, %d graphs)"),
+            *OwnerBP->GetName(),
+            Blueprint.Variables.Num(),
+            Blueprint.Graphs.Num()),
+        EN2CLogSeverity::Info);
+}
+
 void FN2CEditorIntegration::Initialize()
 {
     // Register commands
@@ -657,6 +718,28 @@ void FN2CEditorIntegration::RegisterToolbarForEditor(TSharedPtr<FBlueprintEditor
         })
     );
 
+    // Map the Copy Entire Blueprint JSON command
+    CommandList->MapAction(
+        FN2CToolbarCommand::Get().CopyEntireBlueprintJsonCommand,
+        FExecuteAction::CreateLambda([this, WeakEditor, BlueprintName]()
+        {
+            FN2CLogger::Get().Log(
+                FString::Printf(TEXT("Copy Entire Blueprint JSON triggered for Blueprint: %s"), *BlueprintName),
+                EN2CLogSeverity::Info
+            );
+            ExecuteCopyEntireBlueprintJsonForEditor(WeakEditor);
+        }),
+        FCanExecuteAction::CreateLambda([WeakEditor]()
+        {
+            TSharedPtr<FBlueprintEditor> Editor = WeakEditor.Pin();
+            if (!Editor.IsValid())
+            {
+                return false;
+            }
+            return Editor->GetCurrentMode() == FBlueprintEditorApplicationModes::StandardBlueprintEditorMode;
+        })
+    );
+
     // Store in our map
     EditorCommandLists.Add(WeakEditor, CommandList);
     FN2CLogger::Get().Log(
@@ -684,6 +767,7 @@ void FN2CEditorIntegration::RegisterToolbarForEditor(TSharedPtr<FBlueprintEditor
                     MenuBuilder.AddMenuEntry(FN2CToolbarCommand::Get().OpenWindowCommand);
                     MenuBuilder.AddMenuEntry(FN2CToolbarCommand::Get().CollectNodesCommand);
                     MenuBuilder.AddMenuEntry(FN2CToolbarCommand::Get().CopyJsonCommand);
+                    MenuBuilder.AddMenuEntry(FN2CToolbarCommand::Get().CopyEntireBlueprintJsonCommand);
                     MenuBuilder.AddMenuEntry(FN2CToolbarCommand::Get().TranslateEntireBlueprintCommand);
 
                     return MenuBuilder.MakeWidget();
