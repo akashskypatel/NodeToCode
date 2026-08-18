@@ -6,94 +6,9 @@
 
 namespace
 {
-int32 CountActualLineBreaks(const FString& Input)
-{
-    int32 Count = 0;
-    for (const TCHAR Char : Input)
-    {
-        if (Char == '\n' || Char == '\r')
-        {
-            ++Count;
-        }
-    }
-    return Count;
-}
-
-int32 CountEscapedLineBreaksOutsideCppLiterals(const FString& Input)
-{
-    int32 Count = 0;
-    bool bInDoubleQuotedString = false;
-    bool bInSingleQuotedChar = false;
-    bool bEscapedWithinLiteral = false;
-
-    for (int32 Index = 0; Index < Input.Len(); ++Index)
-    {
-        const TCHAR Char = Input[Index];
-
-        if (bInDoubleQuotedString || bInSingleQuotedChar)
-        {
-            if (bEscapedWithinLiteral)
-            {
-                bEscapedWithinLiteral = false;
-                continue;
-            }
-
-            if (Char == '\\')
-            {
-                bEscapedWithinLiteral = true;
-                continue;
-            }
-
-            if (bInDoubleQuotedString && Char == '"')
-            {
-                bInDoubleQuotedString = false;
-            }
-            else if (bInSingleQuotedChar && Char == '\'')
-            {
-                bInSingleQuotedChar = false;
-            }
-            continue;
-        }
-
-        if (Char == '"')
-        {
-            bInDoubleQuotedString = true;
-            continue;
-        }
-        if (Char == '\'')
-        {
-            bInSingleQuotedChar = true;
-            continue;
-        }
-
-        if (Char == '\\' && Index + 1 < Input.Len())
-        {
-            const TCHAR Next = Input[Index + 1];
-            if (Next == 'n' || Next == 'r')
-            {
-                ++Count;
-            }
-        }
-    }
-
-    return Count;
-}
-
-bool ShouldNormalizeEscapedCodeFormatting(const FString& Input)
-{
-    const int32 EscapedLineBreaks = CountEscapedLineBreaksOutsideCppLiterals(Input);
-    if (EscapedLineBreaks == 0)
-    {
-        return false;
-    }
-
-    const int32 ActualLineBreaks = CountActualLineBreaks(Input);
-    return EscapedLineBreaks >= 2 || ActualLineBreaks == 0;
-}
-
 bool NormalizeEscapedCodeFormatting(FString& InOutCode)
 {
-    if (!ShouldNormalizeEscapedCodeFormatting(InOutCode))
+    if (!InOutCode.Contains(TEXT("\\n")) && !InOutCode.Contains(TEXT("\\r")))
     {
         return false;
     }
@@ -104,10 +19,16 @@ bool NormalizeEscapedCodeFormatting(FString& InOutCode)
     bool bInDoubleQuotedString = false;
     bool bInSingleQuotedChar = false;
     bool bEscapedWithinLiteral = false;
+    int32 ActualLineBreaks = 0;
+    int32 EscapedLineBreaks = 0;
 
     for (int32 Index = 0; Index < InOutCode.Len(); ++Index)
     {
         const TCHAR Char = InOutCode[Index];
+        if (Char == '\n' || Char == '\r')
+        {
+            ++ActualLineBreaks;
+        }
 
         if (bInDoubleQuotedString || bInSingleQuotedChar)
         {
@@ -118,13 +39,11 @@ bool NormalizeEscapedCodeFormatting(FString& InOutCode)
                 bEscapedWithinLiteral = false;
                 continue;
             }
-
             if (Char == '\\')
             {
                 bEscapedWithinLiteral = true;
                 continue;
             }
-
             if (bInDoubleQuotedString && Char == '"')
             {
                 bInDoubleQuotedString = false;
@@ -154,6 +73,7 @@ bool NormalizeEscapedCodeFormatting(FString& InOutCode)
             const TCHAR Next = InOutCode[Index + 1];
             if (Next == 'r')
             {
+                ++EscapedLineBreaks;
                 if (Index + 3 < InOutCode.Len() &&
                     InOutCode[Index + 2] == '\\' &&
                     InOutCode[Index + 3] == 'n')
@@ -170,6 +90,7 @@ bool NormalizeEscapedCodeFormatting(FString& InOutCode)
             }
             if (Next == 'n')
             {
+                ++EscapedLineBreaks;
                 Normalized.AppendChar('\n');
                 ++Index;
                 continue;
@@ -183,6 +104,14 @@ bool NormalizeEscapedCodeFormatting(FString& InOutCode)
         }
 
         Normalized.AppendChar(Char);
+    }
+
+    // A single escaped line break in otherwise multiline code may be intentional documentation.
+    // Multiple structural escapes, or any escape in otherwise single-line code, indicate the
+    // double-escaped response shape seen from some OpenAI-compatible structured-output servers.
+    if (EscapedLineBreaks == 0 || (EscapedLineBreaks == 1 && ActualLineBreaks > 0))
+    {
+        return false;
     }
 
     InOutCode = MoveTemp(Normalized);
