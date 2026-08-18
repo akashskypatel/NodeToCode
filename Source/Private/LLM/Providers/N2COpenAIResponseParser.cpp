@@ -4,6 +4,218 @@
 #include "Utils/N2CLogger.h"
 #include "Serialization/JsonSerializer.h"
 
+namespace
+{
+int32 CountActualLineBreaks(const FString& Input)
+{
+    int32 Count = 0;
+    for (const TCHAR Char : Input)
+    {
+        if (Char == '\n' || Char == '\r')
+        {
+            ++Count;
+        }
+    }
+    return Count;
+}
+
+int32 CountEscapedLineBreaksOutsideCppLiterals(const FString& Input)
+{
+    int32 Count = 0;
+    bool bInDoubleQuotedString = false;
+    bool bInSingleQuotedChar = false;
+    bool bEscapedWithinLiteral = false;
+
+    for (int32 Index = 0; Index < Input.Len(); ++Index)
+    {
+        const TCHAR Char = Input[Index];
+
+        if (bInDoubleQuotedString || bInSingleQuotedChar)
+        {
+            if (bEscapedWithinLiteral)
+            {
+                bEscapedWithinLiteral = false;
+                continue;
+            }
+
+            if (Char == '\\')
+            {
+                bEscapedWithinLiteral = true;
+                continue;
+            }
+
+            if (bInDoubleQuotedString && Char == '"')
+            {
+                bInDoubleQuotedString = false;
+            }
+            else if (bInSingleQuotedChar && Char == '\'')
+            {
+                bInSingleQuotedChar = false;
+            }
+            continue;
+        }
+
+        if (Char == '"')
+        {
+            bInDoubleQuotedString = true;
+            continue;
+        }
+        if (Char == '\'')
+        {
+            bInSingleQuotedChar = true;
+            continue;
+        }
+
+        if (Char == '\\' && Index + 1 < Input.Len())
+        {
+            const TCHAR Next = Input[Index + 1];
+            if (Next == 'n' || Next == 'r')
+            {
+                ++Count;
+            }
+        }
+    }
+
+    return Count;
+}
+
+bool ShouldNormalizeEscapedCodeFormatting(const FString& Input)
+{
+    const int32 EscapedLineBreaks = CountEscapedLineBreaksOutsideCppLiterals(Input);
+    if (EscapedLineBreaks == 0)
+    {
+        return false;
+    }
+
+    const int32 ActualLineBreaks = CountActualLineBreaks(Input);
+    return EscapedLineBreaks >= 2 || ActualLineBreaks == 0;
+}
+
+bool NormalizeEscapedCodeFormatting(FString& InOutCode)
+{
+    if (!ShouldNormalizeEscapedCodeFormatting(InOutCode))
+    {
+        return false;
+    }
+
+    FString Normalized;
+    Normalized.Reserve(InOutCode.Len());
+
+    bool bInDoubleQuotedString = false;
+    bool bInSingleQuotedChar = false;
+    bool bEscapedWithinLiteral = false;
+
+    for (int32 Index = 0; Index < InOutCode.Len(); ++Index)
+    {
+        const TCHAR Char = InOutCode[Index];
+
+        if (bInDoubleQuotedString || bInSingleQuotedChar)
+        {
+            Normalized.AppendChar(Char);
+
+            if (bEscapedWithinLiteral)
+            {
+                bEscapedWithinLiteral = false;
+                continue;
+            }
+
+            if (Char == '\\')
+            {
+                bEscapedWithinLiteral = true;
+                continue;
+            }
+
+            if (bInDoubleQuotedString && Char == '"')
+            {
+                bInDoubleQuotedString = false;
+            }
+            else if (bInSingleQuotedChar && Char == '\'')
+            {
+                bInSingleQuotedChar = false;
+            }
+            continue;
+        }
+
+        if (Char == '"')
+        {
+            bInDoubleQuotedString = true;
+            Normalized.AppendChar(Char);
+            continue;
+        }
+        if (Char == '\'')
+        {
+            bInSingleQuotedChar = true;
+            Normalized.AppendChar(Char);
+            continue;
+        }
+
+        if (Char == '\\' && Index + 1 < InOutCode.Len())
+        {
+            const TCHAR Next = InOutCode[Index + 1];
+            if (Next == 'r')
+            {
+                if (Index + 3 < InOutCode.Len() &&
+                    InOutCode[Index + 2] == '\\' &&
+                    InOutCode[Index + 3] == 'n')
+                {
+                    Normalized.AppendChar('\n');
+                    Index += 3;
+                }
+                else
+                {
+                    Normalized.AppendChar('\r');
+                    ++Index;
+                }
+                continue;
+            }
+            if (Next == 'n')
+            {
+                Normalized.AppendChar('\n');
+                ++Index;
+                continue;
+            }
+            if (Next == 't')
+            {
+                Normalized.AppendChar('\t');
+                ++Index;
+                continue;
+            }
+        }
+
+        Normalized.AppendChar(Char);
+    }
+
+    InOutCode = MoveTemp(Normalized);
+    return true;
+}
+
+void NormalizeEscapedPlainTextFormatting(FString& InOutText)
+{
+    InOutText.ReplaceInline(TEXT("\\r\\n"), TEXT("\n"), ESearchCase::CaseSensitive);
+    InOutText.ReplaceInline(TEXT("\\n"), TEXT("\n"), ESearchCase::CaseSensitive);
+    InOutText.ReplaceInline(TEXT("\\r"), TEXT("\r"), ESearchCase::CaseSensitive);
+    InOutText.ReplaceInline(TEXT("\\t"), TEXT("\t"), ESearchCase::CaseSensitive);
+}
+
+int32 NormalizeOverEscapedGeneratedCode(FN2CTranslationResponse& Response)
+{
+    int32 NormalizedGraphs = 0;
+    for (FN2CGraphTranslation& Graph : Response.Graphs)
+    {
+        const bool bDeclarationNormalized = NormalizeEscapedCodeFormatting(Graph.Code.GraphDeclaration);
+        const bool bImplementationNormalized = NormalizeEscapedCodeFormatting(Graph.Code.GraphImplementation);
+        if (!bDeclarationNormalized && !bImplementationNormalized)
+        {
+            continue;
+        }
+
+        NormalizeEscapedPlainTextFormatting(Graph.Code.ImplementationNotes);
+        ++NormalizedGraphs;
+    }
+    return NormalizedGraphs;
+}
+}
+
 bool UN2COpenAIResponseParser::ParseLLMResponse(
     const FString& InJson,
     FN2CTranslationResponse& OutResponse)
@@ -106,6 +318,21 @@ bool UN2COpenAIResponseParser::ParseLLMResponse(
 
     FN2CLogger::Get().Log(FString::Printf(TEXT("LLM Response Message Content: %s"), *MessageContent), EN2CLogSeverity::Debug);
 
-    // Parse the extracted content as our expected JSON format
-    return Super::ParseLLMResponse(MessageContent, OutResponse);
+    // Parse the extracted content as our expected JSON format.
+    if (!Super::ParseLLMResponse(MessageContent, OutResponse))
+    {
+        return false;
+    }
+
+    const int32 NormalizedGraphs = NormalizeOverEscapedGeneratedCode(OutResponse);
+    if (NormalizedGraphs > 0)
+    {
+        FN2CLogger::Get().LogWarning(
+            FString::Printf(
+                TEXT("Normalized over-escaped line formatting in %d OpenAI-compatible graph response(s)"),
+                NormalizedGraphs),
+            TEXT("OpenAIResponseParser"));
+    }
+
+    return true;
 }
