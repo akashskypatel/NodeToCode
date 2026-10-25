@@ -1,0 +1,17 @@
+interface:
+  display_name: github connector workflows
+  short_description: Use for remote GitHub repository work through the @GitHub connector
+    when a local checkout or direct shell access to the repository is unavailable.
+    Covers repository orientation, atomic file changes, branch and PR operations,
+    GitHub Actions as a remote execution plane, same-repository workflow mailboxes,
+    source snapshots, patch application, workflow logs and artifacts, troubleshooting,
+    retries, and stale trigger cleanup.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

@@ -1,0 +1,122 @@
+# Replace YOUR_BRANCH and the marker path before committing.
+# This template intentionally stores logs outside the worktree.
+name: Connector Remote Task
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - YOUR_BRANCH
+    paths:
+      - .agents/connector-triggers/remote-task.txt
+
+concurrency:
+  group: connector-remote-task-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LOG_DIR: /tmp/connector-remote-task-logs
+  ACTIVITY_LOG: /tmp/connector-remote-task-logs/activity.log
+
+jobs:
+  task:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Initialize persistent log
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOG_DIR"
+          {
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "event_sha=$GITHUB_SHA"
+            echo "ref=$GITHUB_REF"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_temp=$RUNNER_TEMP"
+            echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee "$ACTIVITY_LOG"
+
+      - name: Checkout exact event source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Run bounded remote task
+        id: remote_task
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$LOG_DIR"
+          exec > >(tee -a "$ACTIVITY_LOG") 2>&1
+
+          finish() {
+            rc=$?
+            trap - EXIT
+            set +x
+            {
+              echo "exit_code=$rc"
+              echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "git_status_begin"
+              git status --short --branch || true
+              echo "git_status_end"
+              echo "disk_usage_begin"
+              df -h . || true
+              echo "disk_usage_end"
+            } | tee -a "$ACTIVITY_LOG"
+            exit "$rc"
+          }
+          trap finish EXIT
+
+          echo "tool_versions_begin"
+          git --version
+          bash --version | head -n 1
+          echo "tool_versions_end"
+
+          # Enable command tracing only after secrets are out of scope.
+          set -x
+
+          # Replace this block with one bounded task.
+          git rev-parse HEAD
+          git status --porcelain=v1
+          test -z "$(git status --porcelain=v1)"
+
+      - name: Upload successful task outputs
+        if: steps.remote_task.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-remote-task-output-${{ github.run_id }}
+          path: task-output
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Always upload detailed workflow logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-remote-task-logs-${{ github.run_id }}
+          path: /tmp/connector-remote-task-logs
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
+
+
+  mailbox:
+    if: always()
+    needs: [task]
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/workflow-mailbox-publisher.yml
+    with:
+      mailbox_branch: workflow-mailbox
+      workflow_key: connector-remote-task
+      source_sha: ${{ github.sha }}
+      source_ref: ${{ github.ref }}
+      result: ${{ needs.task.result }}
+      summary: Bounded connector remote task.
