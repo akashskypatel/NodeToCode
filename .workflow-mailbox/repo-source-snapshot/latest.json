@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "workflow_key": "repo-source-snapshot",
+  "workflow": "Reusable Repository Source Snapshot",
+  "workflow_ref": "akashskypatel/NodeToCode/.github/workflows/repo-source-snapshot.yml@refs/heads/main",
+  "repository": "akashskypatel/NodeToCode",
+  "event": "workflow_dispatch",
+  "event_sha": "375c5447a4f2471b8a6c9a7cfbe9d9f361b77777",
+  "source_sha": "ee8070cdcbe53e3d261b70cc418917a43652bbc8",
+  "source_ref": "agent/ollama-cloud",
+  "ref": "refs/heads/main",
+  "ref_name": "main",
+  "run_id": 40240831005,
+  "run_attempt": 1,
+  "run_number": 1,
+  "run_url": "https://github.com/akashskypatel/NodeToCode/actions/runs/40240831005",
+  "result": "success",
+  "summary": "Reusable authoritative repository source snapshot.",
+  "reported_at": "2026-10-25T22:34:50Z",
+  "mailbox_branch": "workflow-mailbox",
+  "artifacts": [
+    {
+      "id": 12616957802,
+      "name": "CODEX_NodeToCode_agent-ollama-cloud-40240831005",
+      "size_in_bytes": 15549642,
+      "digest": "sha256:0ccf92dfe209337d81fbc9766b02e9e05fb0b4e887d74ef1f1fe65041f4a8de3",
+      "expired": false,
+      "created_at": "2026-10-25T22:34:41Z",
+      "expires_at": "2026-11-01T22:34:39Z",
+      "artifact_url": "https://github.com/akashskypatel/NodeToCode/actions/runs/40240831005/artifacts/12616957802",
+      "archive_download_url": "https://api.github.com/repos/akashskypatel/NodeToCode/actions/artifacts/12616957802/zip"
+    },
+    {
+      "id": 12616822876,
+      "name": "workflow-mailbox-publisher-log-40240831005-attempt-1",
+      "size_in_bytes": 363,
+      "digest": "sha256:2d67ca151e97039b3fc63f725a02d15a0721917646734d326748a0b25019a3a9",
+      "expired": false,
+      "created_at": "2026-10-25T22:34:49Z",
+      "expires_at": "2026-11-08T22:34:49Z",
+      "artifact_url": "https://github.com/akashskypatel/NodeToCode/actions/runs/40240831005/artifacts/12616822876",
+      "archive_download_url": "https://api.github.com/repos/akashskypatel/NodeToCode/actions/artifacts/12616822876/zip"
+    },
+    {
+      "id": 12616708163,
+      "name": "CODEX_NodeToCode_agent-ollama-cloud-log-40240831005",
+      "size_in_bytes": 793,
+      "digest": "sha256:108669e1012a1f655a7afd79bef6fed6dac0da2ddf8efd0f848b6860d83373a3",
+      "expired": false,
+      "created_at": "2026-10-25T22:34:42Z",
+      "expires_at": "2026-11-01T22:34:41Z",
+      "artifact_url": "https://github.com/akashskypatel/NodeToCode/actions/runs/40240831005/artifacts/12616708163",
+      "archive_download_url": "https://api.github.com/repos/akashskypatel/NodeToCode/actions/artifacts/12616708163/zip"
+    }
+  ]
+}
