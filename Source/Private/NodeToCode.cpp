@@ -6,6 +6,7 @@
 
 #include "ToolsetRegistry/UToolsetRegistry.h"
 #include "Toolsets/N2CBlueprintToolset.h"
+#include "Toolsets/N2CBlueprintParentMigrationToolset.h"
 #include "HttpModule.h"
 #include "Models/N2CLogging.h"
 #include "Core/N2CEditorIntegration.h"
@@ -33,6 +34,7 @@ void FNodeToCodeModule::StartupModule()
 {
     N2C_LOG_FUNCTION_ENTRY();
     UToolsetRegistry::RegisterToolsetClass(UN2CBlueprintToolset::StaticClass());
+    UToolsetRegistry::RegisterToolsetClass(UN2CBlueprintParentMigrationToolset::StaticClass());
 
     // Initialize logging
     FN2CLogger::Get().Log(TEXT("NodeToCode plugin starting up"), EN2CLogSeverity::Info);
@@ -114,6 +116,7 @@ void FNodeToCodeModule::ShutdownModule()
 {
     N2C_LOG_FUNCTION_ENTRY();
     UToolsetRegistry::UnregisterToolsetClass(UN2CBlueprintToolset::StaticClass());
+    UToolsetRegistry::UnregisterToolsetClass(UN2CBlueprintParentMigrationToolset::StaticClass());
 
     if (FModuleManager::Get().IsModuleLoaded(TEXT("PropertyEditor")))
     {
