@@ -167,8 +167,19 @@ TSharedPtr<FJsonObject> FN2CSerializer::BlueprintToJsonObject(const FN2CBlueprin
 
     // Add structs array
     TArray<TSharedPtr<FJsonValue>> StructsArray;
+    TSet<FString> SerializedStructPaths;
     for (const FN2CStruct& Struct : Blueprint.Structs)
     {
+        const FString Identity = Struct.TypePath.IsEmpty() ? Struct.Name : Struct.TypePath;
+        if (!Identity.IsEmpty() && SerializedStructPaths.Contains(Identity))
+        {
+            continue;
+        }
+        if (!Identity.IsEmpty())
+        {
+            SerializedStructPaths.Add(Identity);
+        }
+
         TSharedPtr<FJsonObject> StructObject = StructToJsonObject(Struct);
         if (StructObject.IsValid())
         {
@@ -179,8 +190,19 @@ TSharedPtr<FJsonObject> FN2CSerializer::BlueprintToJsonObject(const FN2CBlueprin
 
     // Add enums array
     TArray<TSharedPtr<FJsonValue>> EnumsArray;
+    TSet<FString> SerializedEnumPaths;
     for (const FN2CEnum& Enum : Blueprint.Enums)
     {
+        const FString Identity = Enum.TypePath.IsEmpty() ? Enum.Name : Enum.TypePath;
+        if (!Identity.IsEmpty() && SerializedEnumPaths.Contains(Identity))
+        {
+            continue;
+        }
+        if (!Identity.IsEmpty())
+        {
+            SerializedEnumPaths.Add(Identity);
+        }
+
         TSharedPtr<FJsonObject> EnumObject = EnumToJsonObject(Enum);
         if (EnumObject.IsValid())
         {
